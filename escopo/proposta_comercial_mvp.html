@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Proposta Comercial - InnoNFe</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap');
+        
+        body {
+            font-family: 'Outfit', sans-serif;
+            color: #2D3748;
+            line-height: 1.6;
+            margin: 40px;
+            background-color: #ffffff;
+        }
+        
+        .header {
+            border-bottom: 2px solid #E2E8F0;
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            color: #1A365D;
+            font-size: 28px;
+            margin: 0;
+            font-weight: 700;
+        }
+
+        .header p {
+            color: #718096;
+            font-size: 14px;
+            margin: 5px 0 0 0;
+        }
+
+        .section-title {
+            color: #2B6CB0;
+            font-size: 18px;
+            font-weight: 600;
+            border-bottom: 1px solid #E2E8F0;
+            padding-bottom: 8px;
+            margin-top: 30px;
+            margin-bottom: 15px;
+        }
+
+        ul {
+            padding-left: 20px;
+            margin: 10px 0;
+        }
+
+        li {
+            margin-bottom: 8px;
+        }
+
+        .alert-box {
+            background-color: #F7FAFC;
+            border-left: 4px solid #4A5568;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 0 6px 6px 0;
+            font-size: 14px;
+        }
+
+        .footer {
+            margin-top: 50px;
+            font-size: 12px;
+            color: #A0AEC0;
+            text-align: center;
+            border-top: 1px solid #E2E8F0;
+            padding-top: 20px;
+        }
+
+        /* Styles specifically for printing to PDF */
+        @media print {
+            body {
+                margin: 20px;
+                font-size: 13px;
+            }
+            .no-print {
+                display: none;
+            }
+            .page-break {
+                page-break-before: always;
+            }
+        }
+
+        .print-btn {
+            background-color: #2B6CB0;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: 'Outfit', sans-serif;
+            margin-bottom: 20px;
+            transition: background-color 0.2s;
+        }
+
+        .print-btn:hover {
+            background-color: #2C5282;
+        }
+    </style>
+</head>
+<body>
+
+    <button class="print-btn no-print" onclick="window.print()">Salvar como PDF / Imprimir</button>
+
+    <div class="header">
+        <h1>PROPOSTA COMERCIAL DE DESENVOLVIMENTO DE SOFTWARE</h1>
+        <p><strong>Projeto:</strong> InnoNFe — Sistema de Emissão Fiscal Multiempresa (MVP - Fase 1)</p>
+    </div>
+
+    <div class="section-title">1. Visão Geral do Projeto</div>
+    <p>O <strong>InnoNFe</strong> será uma plataforma web SaaS multiempresa focada em centralizar e simplificar a emissão de documentos fiscais (NFC-e e NF-e) para lojas do varejo de joias, semijoias e consignação.</p>
+    <p>O sistema atuará de forma independente do ERP principal (<strong>InnoSystem</strong>), conectando-se a uma API integradora de serviços fiscais (ex: Focus NFe, Nuvem Fiscal ou PlugNotas) sob um contrato centralizado, mantendo o ERP principal totalmente livre de complexidades e riscos de regras fiscais.</p>
+
+    <div class="section-title">2. Escopo do MVP (Fase 1)</div>
+    <p>O desenvolvimento da Fase 1 compreende as seguintes funcionalidades e interfaces:</p>
+
+    <strong>2.1. Módulo de Cadastros e Configurações (Multi-tenant)</strong>
+    <ul>
+        <li><strong>Cadastro de Empresas (Clientes):</strong> Painel para cadastrar novos estabelecimentos (Razão Social, Nome Fantasia, CNPJ, IE, Endereço, Contato, etc.).</li>
+        <li><strong>Cofre de Certificados:</strong> Upload seguro do Certificado Digital A1 (<code>.pfx</code> / <code>.p12</code>) e armazenamento criptografado da senha em banco de dados.</li>
+        <li><strong>Configuração de Regras Fiscais:</strong> Painel para parametrização base de Operações Fiscais por empresa (CFOP, NCM padrão, ICMS/CSOSN, PIS, COFINS).</li>
+        <li><strong>Credenciais NFC-e:</strong> Cadastro do Token CSC e ID do CSC emitidos pela SEFAZ de cada estado.</li>
+    </ul>
+
+    <strong>2.2. Tela "Emitir Nota" (Ponte de Dados "Copia e Cola")</strong>
+    <ul>
+        <li>Área para o operador colar o JSON estruturado gerado pelo InnoSystem.</li>
+        <li>Visualização prévia estruturada dos dados da venda (Itens, Valores, Formas de Pagamento).</li>
+        <li>Processamento das regras fiscais e geração do payload para a integradora.</li>
+        <li><strong>Botões de Ação:</strong>
+            <ul>
+                <li><strong>Emitir NFC-e (modelo 65):</strong> Envio síncrono com retorno e exibição de resultado em tempo real.</li>
+                <li><strong>Emitir NF-e (modelo 55):</strong> Envio assíncrono (com controle de status/polling integrado).</li>
+            </ul>
+        </li>
+    </ul>
+
+    <div class="page-break"></div>
+
+    <strong>2.3. Central de Documentos (Consulta e Gestão)</strong>
+    <ul>
+        <li>Tela de consulta/listagem unificada de todas as notas (NF-e/NFC-e) geradas por período e empresa, com filtros por status e cliente.</li>
+        <li><strong>Menu de Ações Rápidas por Nota selecionada:</strong>
+            <ul>
+                <li>Visualizar/Baixar XML.</li>
+                <li>Visualizar/Baixar PDF (DANFE/DANFCE).</li>
+                <li>Baixar em lote (Zip contendo XML/PDFs das notas filtradas).</li>
+                <li>Cancelar nota (com justificativa, respeitando prazos legais).</li>
+                <li><strong>Reprocessar Erro:</strong> Fluxo inteligente para corrigir dados de notas rejeitadas pela SEFAZ diretamente na tela e reenviar sem necessidade de recolar os dados da venda.</li>
+            </ul>
+        </li>
+    </ul>
+
+    <div class="section-title">3. Cronograma de Entregas Sugerido</div>
+    <p>O desenvolvimento será dividido em etapas funcionais para acompanhamento contínuo:</p>
+    <ul>
+        <li><strong>Etapa A:</strong> Configuração do Banco de Dados e Cadastros (Empresas + Cofre de Certificado A1).</li>
+        <li><strong>Etapa B:</strong> Módulo de Regras Fiscais (Configuração e mapeamento de CFOP/NCM).</li>
+        <li><strong>Etapa C:</strong> Integração e Emissão Síncrona de NFC-e (Ambiente de Homologação).</li>
+        <li><strong>Etapa D:</strong> Emissão Assíncrona de NF-e (Fila de processamento e consulta de status).</li>
+        <li><strong>Etapa E:</strong> Central de Documentos Completa (Filtros, Cancelamento e Fluxo de Reprocessamento de Erros).</li>
+        <li><strong>Etapa F:</strong> Exportações e download em lote (XML/DANFE).</li>
+    </ul>
+
+    <div class="section-title">4. Limitações de Escopo (Fase 2 / Futuro)</div>
+    <p>Para garantir foco e velocidade na validação do MVP, estão fora do escopo desta Fase 1:</p>
+    <ul>
+        <li>Integração direta automatizada via API entre InnoSystem e InnoNFe.</li>
+        <li>Emissão de NF-e de Devolução/Estorno.</li>
+        <li>Inutilização de Numeração (comunicação à SEFAZ de faixas numéricas não utilizadas por falhas ou saltos de sequência).</li>
+        <li>Tratamento automatizado de contingência offline local.</li>
+        <li>Painel White-Label/Acesso direto para o cliente final do lojista.</li>
+        <li>Emissão de NFS-e (Serviços).</li>
+        <li>Relatórios gerenciais complexos e dashboards financeiros.</li>
+    </ul>
+
+    <div class="section-title">5. Proposta Comercial</div>
+    <p>O valor total de investimento para o desenvolvimento do MVP descrito neste escopo é de <strong>R$ 6.000,00</strong> (Seis mil reais).</p>
+    
+
+
+    <div class="footer">
+        Documento gerado como base de escopo comercial (MVP) e cronograma técnico.
+    </div>
+
+</body>
+</html>

@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --ink: #0f1b2d;
+    --ink-soft: #3a4a61;
+    --muted: #8190a5;
+    --line: #e4e9f0;
+    --line-soft: #eef2f7;
+    --bg: #f5f7fa;
+    --card: #fff;
+    --i9: #0b63c4;
+    --i9-dark: #084a94;
+    --i9-tint: #eaf3fd;
+    --gold: #e6a817;
+    --ok: #1e874b;
+    --ok-tint: #e7f5ec;
+    --warn: #c0392b;
+    --warn-tint: #fdecec;
+    --pend: #b7791f;
+    --pend-tint: #fdf3e2;
+    --field: #fbfcfe;
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(15,27,45,.04), 0 8px 30px rgba(15,27,45,.06);
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: radial-gradient(1200px 500px at 85% -10%, #eaf3fd 0%, rgba(234, 243, 253, 0) 60%), var(--bg);
+    color: var(--ink);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+}
