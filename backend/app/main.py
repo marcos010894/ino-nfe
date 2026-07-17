@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.models.database import init_db
-from app.api import auth, empresas, regras_fiscais
+from app.api import auth, empresas, regras_fiscais, notas
 
 app = FastAPI(title="InnoNFe API", description="API para emissão fiscal", version="1.0.0")
 
@@ -29,4 +29,5 @@ def health_check():
 app.include_router(auth.router)
 app.include_router(empresas.router)
 app.include_router(regras_fiscais.router)
+app.include_router(notas.router)
 
