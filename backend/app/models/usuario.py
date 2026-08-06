@@ -12,4 +12,5 @@ class Usuario(SQLModel, table=True):
     cpf: str = Field(default="")
     telefone: str = Field(default="")
     ativo: bool = Field(default=True)
+    token_integracao: Optional[str] = Field(default=None, unique=True, index=True)
     criado_em: datetime = Field(default_factory=datetime.utcnow)

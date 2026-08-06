@@ -1,12 +1,39 @@
 import { useEffect, useState } from 'react';
-import { FileText, Play, CheckCircle2, XCircle, Loader2, Download, ExternalLink, RefreshCw, AlertCircle, Coins, Plus, Trash2, Edit3 } from 'lucide-react';
+import { FileText, Play, CheckCircle2, XCircle, Loader2, Download, ExternalLink, AlertCircle, Coins, Plus, Trash2, Edit3 } from 'lucide-react';
 import api from '../../lib/api';
+import { useSearchParams } from 'react-router-dom';
 
 interface Empresa {
   id: number;
   razao_social: string;
   nome_fantasia: string;
   cnpj: string;
+  has_certificado?: boolean;
+}
+
+/**
+ * Extrai a mensagem de rejeição da resposta_integradora da ACBr.
+ * O motivo real vive em `autorizacao.motivo_status` (+ `codigo_status` como cStat).
+ * Fallbacks: `error.message` (erros HTTP ACBr), `motivo_status` (raiz), `motivo`,
+ * `mensagem`, `erro` string. Sem esses, devolve string vazia (deixa caller usar default).
+ */
+function extrairMotivoRejeicao(r: any): string {
+  if (!r || typeof r !== 'object') return '';
+  const aut = r.autorizacao || {};
+  const cstat = aut.codigo_status || r.codigo_status;
+  const motivoAut = aut.motivo_status || r.motivo_status;
+  if (motivoAut) {
+    return cstat ? `cStat ${cstat}: ${motivoAut}` : String(motivoAut);
+  }
+  const err = r.error;
+  if (err && typeof err === 'object') {
+    const code = err.code ? `[${err.code}] ` : '';
+    if (err.message) return `${code}${err.message}`;
+  }
+  if (typeof r.erro === 'string') return r.erro;
+  if (r.motivo) return String(r.motivo);
+  if (r.mensagem) return String(r.mensagem);
+  return '';
 }
 
 interface ItemManual {
@@ -20,6 +47,8 @@ interface ItemManual {
 export default function EmitirNota() {
   const [empresas, setEmpresas] = useState<Empresa[]>([]);
   const [empresaSelecionada, setEmpresaSelecionada] = useState<string>('');
+  
+  const empSelecionadaObj = empresas.find(e => e.id.toString() === empresaSelecionada);
   
   // Abas de Modo: 'json' ou 'manual'
   const [modoEntrada, setModoEntrada] = useState<'json' | 'manual'>('json');
@@ -55,38 +84,26 @@ export default function EmitirNota() {
   const [erroEmissao, setErroEmissao] = useState<string>('');
   const [pollingActive, setPollingActive] = useState<boolean>(false);
   
-  // Carregar lista de empresas
-  useEffect(() => {
-    api.get('/empresas/')
-      .then(res => {
-        setEmpresas(res.data);
-        if (res.data.length > 0) {
-          setEmpresaSelecionada(res.data[0].id.toString());
-        }
-      })
-      .catch(err => {
-        console.error("Erro ao carregar empresas:", err);
-      });
-  }, []);
+  const [searchParams] = useSearchParams();
+  const rascunhoId = searchParams.get('rascunho');
 
-  // Sincronizar Preview no Modo Manual
+  // Carregar Rascunho se existir
   useEffect(() => {
-    if (modoEntrada === 'manual') {
-      const vendaObj = {
-        cliente: clienteNome || clienteCpf ? { nome: clienteNome, cpf: clienteCpf } : undefined,
-        itens: itensManuais,
-        desconto: descontoManual,
-        pagamentos: [
-          {
-            meio_pagamento: meioPagamento,
-            valor: Math.max(0, itensManuais.reduce((acc, it) => acc + (it.quantidade * it.valor_unitario), 0) - descontoManual)
+    if (rascunhoId) {
+      api.get(`/integracao/rascunhos/${rascunhoId}`)
+        .then(res => {
+          if (res.data.json_venda) {
+            setJsonVenda(res.data.json_venda);
+            validarEPreview(res.data.json_venda);
+            setModoEntrada('json');
           }
-        ]
-      };
-      setPreviewVenda(vendaObj);
-      setJsonValido(itensManuais.length > 0);
+        })
+        .catch(err => {
+          console.error("Erro ao carregar rascunho:", err);
+          alert("Erro ao carregar o rascunho.");
+        });
     }
-  }, [modoEntrada, clienteNome, clienteCpf, descontoManual, meioPagamento, itensManuais]);
+  }, [rascunhoId]);
 
   const jsonExemplo = {
     cliente: {
@@ -118,6 +135,44 @@ export default function EmitirNota() {
     ]
   };
 
+  // Carregar lista de empresas e inicializar JSON de exemplo
+  useEffect(() => {
+    const exemploStr = JSON.stringify(jsonExemplo, null, 2);
+    setJsonVenda(exemploStr);
+    setJsonValido(true);
+    setPreviewVenda(jsonExemplo);
+
+    api.get('/empresas/')
+      .then(res => {
+        setEmpresas(res.data);
+        if (res.data.length > 0) {
+          setEmpresaSelecionada(res.data[0].id.toString());
+        }
+      })
+      .catch(err => {
+        console.error("Erro ao carregar empresas:", err);
+      });
+  }, []);
+
+  // Sincronizar Preview no Modo Manual
+  useEffect(() => {
+    if (modoEntrada === 'manual') {
+      const vendaObj = {
+        cliente: clienteNome || clienteCpf ? { nome: clienteNome, cpf: clienteCpf } : undefined,
+        itens: itensManuais,
+        desconto: descontoManual,
+        pagamentos: [
+          {
+            meio_pagamento: meioPagamento,
+            valor: Math.max(0, itensManuais.reduce((acc, it) => acc + (it.quantidade * it.valor_unitario), 0) - descontoManual)
+          }
+        ]
+      };
+      setPreviewVenda(vendaObj);
+      setJsonValido(itensManuais.length > 0);
+    }
+  }, [modoEntrada, clienteNome, clienteCpf, descontoManual, meioPagamento, itensManuais]);
+
   const usarExemplo = () => {
     const str = JSON.stringify(jsonExemplo, null, 2);
     setJsonVenda(str);
@@ -142,7 +197,7 @@ export default function EmitirNota() {
       const parsed = JSON.parse(val);
       if (!parsed.itens || !Array.isArray(parsed.itens) || parsed.itens.length === 0) {
         setJsonValido(false);
-        setErroJson("O JSON precisa de um array 'itens' válido.");
+        setErroJson("O JSON precisa de um array 'itens' válido com ao menos um item.");
         setPreviewVenda(null);
         return;
       }
@@ -172,23 +227,36 @@ export default function EmitirNota() {
 
   // Enviar para emissão
   const emitirDocumento = async (modelo: string) => {
-    if (!empresaSelecionada) {
-      setErroEmissao("Selecione uma empresa emissora.");
-      return;
-    }
-    if (!jsonValido) {
-      setErroEmissao("Os dados da venda possuem erros de validação.");
-      return;
-    }
-
-    setEmitindo(true);
-    setResultado(null);
     setErroEmissao('');
+    setResultado(null);
+
+    if (!empresaSelecionada) {
+      setErroEmissao("Selecione uma empresa emissora antes de prosseguir.");
+      return;
+    }
 
     let jsonPayload = '';
     if (modoEntrada === 'json') {
-      jsonPayload = jsonVenda;
+      if (!jsonVenda.trim()) {
+        setErroEmissao("Cole the JSON de venda antes de emitir.");
+        return;
+      }
+      try {
+        const parsed = JSON.parse(jsonVenda);
+        if (!parsed.itens || !Array.isArray(parsed.itens) || parsed.itens.length === 0) {
+          setErroEmissao("O JSON da venda precisa conter ao menos um item em 'itens'.");
+          return;
+        }
+        jsonPayload = jsonVenda;
+      } catch (e: any) {
+        setErroEmissao(`JSON da Venda Inválido: ${e.message}`);
+        return;
+      }
     } else {
+      if (itensManuais.length === 0) {
+        setErroEmissao("Adicione ao menos um item na lista de itens.");
+        return;
+      }
       const totalNota = Math.max(0, itensManuais.reduce((acc, it) => acc + (it.quantidade * it.valor_unitario), 0) - descontoManual);
       jsonPayload = JSON.stringify({
         cliente: clienteNome || clienteCpf ? { nome: clienteNome, cpf: clienteCpf } : undefined,
@@ -198,14 +266,25 @@ export default function EmitirNota() {
       });
     }
 
+    setEmitindo(true);
+
     try {
       const res = await api.post(`/empresas/${empresaSelecionada}/notas/`, {
         json_venda: jsonPayload,
-        modelo: modelo
+        modelo: modelo,
+        rascunho_id: rascunhoId ? parseInt(rascunhoId) : undefined
       });
       
       const nota = res.data;
-      const parsedResposta = nota.resposta_integradora ? JSON.parse(nota.resposta_integradora) : {};
+      let parsedResposta: any = {};
+      if (nota.resposta_integradora) {
+        try {
+          parsedResposta = JSON.parse(nota.resposta_integradora);
+        } catch (e) {
+          parsedResposta = { motivo: String(nota.resposta_integradora) };
+        }
+      }
+
       
       if (nota.status === 'autorizada') {
         setResultado({
@@ -231,19 +310,31 @@ export default function EmitirNota() {
         });
         iniciarPollingNfe(nota.id);
       } else {
-        const msgErro = parsedResposta.motivo || parsedResposta.mensagem || parsedResposta.erro || "Rejeitada pela SEFAZ (Verifique regras de ICMS/CSC)";
+        const msgErro = extrairMotivoRejeicao(parsedResposta) || "Rejeitada pela SEFAZ (Verifique regras de ICMS/CSC)";
+
         setResultado({
           sucesso: false,
           mensagem: msgErro
         });
       }
     } catch (err: any) {
-      console.error(err);
-      setErroEmissao(err.response?.data?.detail || "Erro desconhecido ao transmitir a nota.");
+      console.error("Erro na emissao de nota:", err);
+      let detailMsg = err.message || "Erro desconhecido ao transmitir a nota.";
+      if (err.response?.data?.detail) {
+        const d = err.response.data.detail;
+        if (typeof d === 'string') detailMsg = d;
+        else if (Array.isArray(d)) detailMsg = d.map((e: any) => `${e.loc?.join('.') || 'Campo'}: ${e.msg}`).join(' | ');
+        else detailMsg = JSON.stringify(d);
+      } else if (err.response?.status === 401) {
+        detailMsg = "Sua sessão expirou ou credenciais inválidas. Faça login novamente em /login.";
+      }
+      setErroEmissao(detailMsg);
     } finally {
       setEmitindo(false);
     }
   };
+
+
 
   const iniciarPollingNfe = (notaId: number) => {
     setPollingActive(true);
@@ -266,13 +357,21 @@ export default function EmitirNota() {
               xml: nota.xml_url
             });
           } else {
-            const parsed = nota.resposta_integradora ? JSON.parse(nota.resposta_integradora) : {};
-            const msg = parsed.motivo || parsed.mensagem || parsed.erro || "Rejeitada pela SEFAZ";
+            let parsed: any = {};
+            if (nota.resposta_integradora) {
+              try {
+                parsed = JSON.parse(nota.resposta_integradora);
+              } catch (e) {
+                parsed = { motivo: String(nota.resposta_integradora) };
+              }
+            }
+            const msg = extrairMotivoRejeicao(parsed) || "Rejeitada pela SEFAZ";
             setResultado({
               sucesso: false,
               mensagem: msg
             });
           }
+
         }
       } catch (err) {
         console.error("Erro no polling de status:", err);
@@ -280,8 +379,7 @@ export default function EmitirNota() {
     }, 5000);
   };
 
-  const dummyPlaceHolder = () => {
-  };
+
 
   const baixarXML = async () => {
     if (!resultado || !resultado.id) return;
@@ -385,12 +483,24 @@ export default function EmitirNota() {
               ) : (
                 empresas.map(emp => (
                   <option key={emp.id} value={emp.id}>
-                    {emp.nome_fantasia || emp.razao_social} - {emp.cnpj}
+                    {emp.nome_fantasia || emp.razao_social} - {emp.cnpj} {!emp.has_certificado ? ' (Sem Certificado A1)' : ''}
                   </option>
                 ))
               )}
             </select>
+
+            {empSelecionadaObj && !empSelecionadaObj.has_certificado && (
+              <div className="bg-red-500/10 border border-red-500/30 text-red-400 p-3 rounded-lg text-xs font-semibold flex items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <AlertCircle size={15} /> Empresa sem Certificado Digital A1 ativo.
+                </span>
+                <a href={`/empresas/${empSelecionadaObj.id}`} className="underline font-bold hover:text-white">
+                  Cadastrar Certificado →
+                </a>
+              </div>
+            )}
           </div>
+
 
           {modoEntrada === 'json' ? (
             /* Modo JSON Area */
@@ -610,13 +720,11 @@ export default function EmitirNota() {
                   <div className="border border-line rounded-lg overflow-hidden divide-y divide-line-soft">
                     {previewVenda.itens.map((item: any, idx: number) => (
                       <div key={idx} className="p-3 flex justify-between items-center text-xs hover:bg-i9-tint/20">
-                        <div className="flex flex-col gap-0.5">
-                          <span className="font-bold text-ink">{item.nome.toUpperCase()}</span>
-                          <span className="text-muted text-[10px] font-medium">Qtd: {item.quantidade} {item.unidade || 'UN'} × R$ {item.valor_unitario.toFixed(2)}</span>
+                        <div className="flex flex-col">
+                          <span className="text-ink">{item.descricao || item.nome}</span>
+                          <span className="text-muted text-[10px] font-medium">Qtd: {item.quantidade} {item.unidade || 'UN'} × R$ {Number(item.valor_unitario || 0).toFixed(2)}</span>
                         </div>
-                        <span className="font-bold text-ink font-mono">
-                          R$ {(item.quantidade * item.valor_unitario).toFixed(2)}
-                        </span>
+                        <span className="font-mono text-ink">R$ {(Number(item.quantidade || 0) * Number(item.valor_unitario || 0)).toFixed(2)}</span>
                       </div>
                     ))}
                   </div>
@@ -628,10 +736,10 @@ export default function EmitirNota() {
                     <span>Subtotal dos itens</span>
                     <span className="font-mono">R$ {calcularSubtotal().toFixed(2)}</span>
                   </div>
-                  {parseFloat(previewVenda.desconto) > 0 && (
+                  {Number(previewVenda.desconto || 0) > 0 && (
                     <div className="flex justify-between text-xs text-warn font-semibold">
                       <span>Desconto</span>
-                      <span className="font-mono">- R$ {parseFloat(previewVenda.desconto).toFixed(2)}</span>
+                      <span className="font-mono">- R$ {Number(previewVenda.desconto).toFixed(2)}</span>
                     </div>
                   )}
                   <div className="flex justify-between items-center text-sm font-bold text-ink border-t border-line-soft pt-3 mt-1">
@@ -649,7 +757,7 @@ export default function EmitirNota() {
                         <span>
                           {pag.meio_pagamento === "17" ? "PIX" : pag.meio_pagamento === "01" ? "Dinheiro" : pag.meio_pagamento === "03" ? "Cartão Crédito" : pag.meio_pagamento === "04" ? "Cartão Débito" : "Outros"}
                         </span>
-                        <span className="font-mono text-ink">R$ {parseFloat(pag.valor).toFixed(2)}</span>
+                        <span className="font-mono text-ink">R$ {Number(pag.valor || 0).toFixed(2)}</span>
                       </div>
                     ))}
                   </div>
@@ -657,9 +765,15 @@ export default function EmitirNota() {
                 
                 {/* Botões de Transmissão */}
                 <div className="flex flex-col gap-2">
+                  {!empSelecionadaObj?.has_certificado && (
+                    <div className="bg-warn-tint border border-[#f0c9c4] text-warn p-3 rounded-xl text-xs font-semibold flex items-center gap-2 mb-2">
+                      <AlertCircle size={16} />
+                      Você precisa configurar o Certificado Digital da empresa antes de emitir notas.
+                    </div>
+                  )}
                   <button
                     onClick={() => emitirDocumento('65')}
-                    disabled={emitindo || pollingActive || !jsonValido}
+                    disabled={emitindo || pollingActive || !jsonValido || !empSelecionadaObj?.has_certificado}
                     className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-b from-i9 to-i9-dark text-white font-extrabold text-sm shadow hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {emitindo && !pollingActive ? (
@@ -676,7 +790,7 @@ export default function EmitirNota() {
                   </button>
                   <button
                     onClick={() => emitirDocumento('55')}
-                    disabled={emitindo || pollingActive || !jsonValido}
+                    disabled={emitindo || pollingActive || !jsonValido || !empSelecionadaObj?.has_certificado}
                     className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-white border border-i9 text-i9 font-extrabold text-sm shadow hover:bg-i9-tint/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {pollingActive ? (

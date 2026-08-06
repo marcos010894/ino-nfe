@@ -45,6 +45,7 @@ export default function Layout() {
     { name: 'Empresas', path: '/empresas', icon: <Building2 size={18} /> },
     { name: 'Emitir Nota', path: '/emitir', icon: <FileText size={18} /> },
     { name: 'Documentos', path: '/documentos', icon: <Files size={18} /> },
+    { name: 'Notas Recebidas', path: '/documentos/rascunhos', icon: <FileText size={18} /> },
   ];
 
   return (

@@ -9,6 +9,7 @@ import RegrasFiscaisList from './pages/empresas/RegrasFiscaisList';
 import RegraFiscalForm from './pages/empresas/RegraFiscalForm';
 import EmitirNota from './pages/empresas/EmitirNota';
 import CentralDocumentos from './pages/empresas/CentralDocumentos';
+import NotasRecebidas from './pages/documentos/NotasRecebidas';
 import { isAuthenticated } from './lib/auth';
 
 function PublicRoute({ children }: { children: React.ReactNode }) {
@@ -32,6 +33,7 @@ export default function App() {
           <Route path="empresas/:id/regras/:regraId" element={<RegraFiscalForm />} />
           <Route path="emitir" element={<EmitirNota />} />
           <Route path="documentos" element={<CentralDocumentos />} />
+          <Route path="documentos/rascunhos" element={<NotasRecebidas />} />
         </Route>
         
         <Route path="*" element={<Navigate to="/" replace />} />

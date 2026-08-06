@@ -19,6 +19,7 @@ from app.models.usuario import Usuario
 from app.models.empresa import Empresa
 from app.models.certificado import Certificado
 from app.models.regra_fiscal import RegraFiscal
+from app.models.nota import Nota
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

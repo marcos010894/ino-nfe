@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-
+from typing import Optional
 class UsuarioCreate(BaseModel):
     nome: str
     email: EmailStr
@@ -18,7 +18,7 @@ class UsuarioResponse(BaseModel):
     cpf: str
     telefone: str
     ativo: bool
-    
+    token_integracao: Optional[str] = None
 class Token(BaseModel):
     access_token: str
     token_type: str

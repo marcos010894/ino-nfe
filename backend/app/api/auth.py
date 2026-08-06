@@ -60,5 +60,11 @@ def login(user_in: UsuarioLogin, session: Session = Depends(get_session)):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @router.get("/me", response_model=UsuarioResponse)
-def get_me(current_user: Usuario = Depends(get_current_user)):
+def get_me(current_user: Usuario = Depends(get_current_user), session: Session = Depends(get_session)):
+    import secrets
+    if not current_user.token_integracao:
+        current_user.token_integracao = secrets.token_urlsafe(32)
+        session.add(current_user)
+        session.commit()
+        session.refresh(current_user)
     return current_user

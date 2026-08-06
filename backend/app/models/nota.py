@@ -6,10 +6,12 @@ class Nota(SQLModel, table=True):
     __tablename__ = "notas"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    empresa_id: int = Field(foreign_key="empresas.id", index=True)
+    usuario_id: int = Field(foreign_key="usuarios.id", index=True, default=1)
+    empresa_id: Optional[int] = Field(default=None, foreign_key="empresas.id", index=True)
     modelo: str = Field(default="65", max_length=2)  # "65" = NFC-e, "55" = NF-e
     status: str = Field(default="rascunho", max_length=20)  # rascunho, processando, autorizada, rejeitada, cancelada
     chave_acesso: Optional[str] = Field(default=None, max_length=44)
+    acbr_id: Optional[str] = Field(default=None, max_length=64, index=True)  # id interno ACBr (nfc_xxx / nfe_xxx) — usado em GET XML/PDF e cancelamento
     numero: Optional[int] = None
     serie: Optional[int] = None
     valor_total: float = Field(default=0.0)

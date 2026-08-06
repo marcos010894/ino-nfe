@@ -1,0 +1,29 @@
+{
+  "cliente": {
+    "nome": "Consumidor Exemplo",
+    "cpf": "12345678909"
+  },
+  "itens": [
+    {
+      "codigo": "JOIA001",
+      "nome": "Anel de Prata Solitário",
+      "quantidade": 1,
+      "valor_unitario": 150,
+      "unidade": "UN"
+    },
+    {
+      "codigo": "JOIA002",
+      "nome": "Brinco Ouro 18k Argola",
+      "quantidade": 2,
+      "valor_unitario": 450,
+      "unidade": "PR"
+    }
+  ],
+  "desconto": 50,
+  "pagamentos": [
+    {
+      "meio_pagamento": "17",
+      "valor": 1000
+    }
+  ]
+}

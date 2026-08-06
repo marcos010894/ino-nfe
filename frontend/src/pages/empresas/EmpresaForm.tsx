@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
-import { ArrowLeft, Save, UploadCloud, Search, Loader2 } from 'lucide-react';
+import { ArrowLeft, Save, UploadCloud, Loader2, Zap } from 'lucide-react';
+
 import api from '../../lib/api';
 import { formatCNPJ, formatCEP, unformat } from '../../lib/formatters';
+
 
 export default function EmpresaForm() {
   const { id } = useParams();
@@ -24,7 +26,9 @@ export default function EmpresaForm() {
     contato_email: '',
     regime_tributario: 'Simples Nacional',
     csc_id: '',
-    csc_token: ''
+    csc_token: '',
+    serie_nfe: 1,
+    serie_nfce: 1
   });
 
   const [certFile, setCertFile] = useState<File | null>(null);
@@ -33,6 +37,15 @@ export default function EmpresaForm() {
   const [loading, setLoading] = useState(isEditing);
   const [salvando, setSalvando] = useState(false);
   const [erro, setErro] = useState('');
+
+  // Inutilização de faixa de numeração (Etapa G do MVP).
+  // Só faz sentido em modo edição — precisa da empresa já criada.
+  const [inutModelo, setInutModelo] = useState<'55' | '65'>('55');
+  const [inutIni, setInutIni] = useState<string>('');
+  const [inutFin, setInutFin] = useState<string>('');
+  const [inutJust, setInutJust] = useState<string>('Correcao de sequencia por gap na numeracao do sistema emissor');
+  const [inutLoading, setInutLoading] = useState(false);
+  const [inutStatus, setInutStatus] = useState<string>('');
 
   useEffect(() => {
     if (isEditing) {
@@ -154,7 +167,10 @@ export default function EmpresaForm() {
       const dataToSave = {
         ...formData,
         cnpj: unformat(formData.cnpj),
-        cep: unformat(formData.cep)
+        cep: unformat(formData.cep),
+        // inputs type=number vêm como string do DOM — coagir pra int aqui.
+        serie_nfe: Number(formData.serie_nfe) || 1,
+        serie_nfce: Number(formData.serie_nfce) || 1,
       };
 
       if (isEditing) {
@@ -177,9 +193,94 @@ export default function EmpresaForm() {
 
       navigate('/empresas');
     } catch (err: any) {
-      setErro(err.response?.data?.detail || 'Erro ao salvar os dados.');
+      if (err.response?.data?.detail) {
+        if (Array.isArray(err.response.data.detail)) {
+          setErro(err.response.data.detail.map((e: any) => `${e.loc.join('.')}: ${e.msg}`).join(' | '));
+        } else {
+          setErro(err.response.data.detail);
+        }
+      } else {
+        setErro('Erro ao salvar os dados.');
+      }
     } finally {
       setSalvando(false);
+    }
+  };
+
+  const [sincronizandoAcbr, setSincronizandoAcbr] = useState(false);
+  const [acbrStatusMsg, setAcbrStatusMsg] = useState('');
+
+  const handleInutilizar = async () => {
+    if (!id) return;
+    const ini = Number(inutIni);
+    const fin = Number(inutFin);
+    if (!Number.isInteger(ini) || !Number.isInteger(fin) || ini < 1 || fin < ini) {
+      setInutStatus('Faixa inválida — número final precisa ser ≥ inicial e ambos > 0.');
+      return;
+    }
+    if (inutJust.trim().length < 15) {
+      setInutStatus('Justificativa precisa ter no mínimo 15 caracteres.');
+      return;
+    }
+    // SEFAZ limita 999 números por lote — se a faixa for maior, chunk em vários lotes.
+    const CHUNK = 999;
+    const total = fin - ini + 1;
+    const lotes: Array<[number, number]> = [];
+    for (let s = ini; s <= fin; s += CHUNK) {
+      lotes.push([s, Math.min(s + CHUNK - 1, fin)]);
+    }
+    if (lotes.length > 5) {
+      const ok = window.confirm(
+        `Vou fazer ${lotes.length} chamadas SEFAZ (${total} números). Isso pode levar alguns minutos. Continuar?`
+      );
+      if (!ok) return;
+    }
+
+    setInutLoading(true);
+    setInutStatus('');
+    let sucesso = 0;
+    let falha = 0;
+    let ultimoErro = '';
+    for (let i = 0; i < lotes.length; i++) {
+      const [a, b] = lotes[i];
+      setInutStatus(`Lote ${i + 1}/${lotes.length}: inutilizando ${a}–${b}...`);
+      try {
+        await api.post(`/empresas/${id}/notas/inutilizacoes`, {
+          modelo: inutModelo,
+          serie: inutModelo === '55' ? Number(formData.serie_nfe) || 1 : Number(formData.serie_nfce) || 1,
+          numero_inicial: a,
+          numero_final: b,
+          justificativa: inutJust.trim(),
+        });
+        sucesso++;
+      } catch (err: any) {
+        falha++;
+        ultimoErro = err?.response?.data?.detail || err?.message || 'erro desconhecido';
+      }
+    }
+    setInutLoading(false);
+    setInutStatus(
+      falha === 0
+        ? `✅ ${sucesso} lote(s) inutilizado(s) — ${total} números.`
+        : `⚠️ Concluído com falhas: ${sucesso} ok, ${falha} erro. Último erro: ${ultimoErro}`
+    );
+  };
+
+  const handleSincronizarAcbr = async () => {
+    if (!id) return;
+    setSincronizandoAcbr(true);
+    setAcbrStatusMsg('');
+    try {
+      const res = await api.post(`/empresas/${id}/sincronizar-acbr`);
+      setFormData(prev => ({
+        ...prev,
+        ...res.data
+      }));
+      setAcbrStatusMsg(res.data.acbr_ultimo_status || 'Sincronizado com sucesso com ACBr!');
+    } catch (err: any) {
+      setAcbrStatusMsg('Erro ao comunicar com a ACBr API.');
+    } finally {
+      setSincronizandoAcbr(false);
     }
   };
 
@@ -193,18 +294,30 @@ export default function EmpresaForm() {
         </Link>
         <div className="flex-1 flex items-center justify-between">
           <h1 className="text-2xl font-extrabold tracking-tight">
-            {isEditing ? 'Editar Empresa' : 'Nova Empresa'}
+            {isEditing ? 'Editar Empresa & Certificado' : 'Nova Empresa'}
           </h1>
           {isEditing && (
-            <Link 
-              to={`/empresas/${id}/regras`}
-              className="bg-line-soft border border-line text-ink font-bold px-4 py-2 rounded-lg text-sm hover:bg-i9-tint hover:border-i9 hover:text-i9 transition-colors"
-            >
-              Ver Regras Fiscais
-            </Link>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleSincronizarAcbr}
+                disabled={sincronizandoAcbr}
+                className="bg-blue-500/10 border border-blue-500/30 text-blue-400 font-bold px-3 py-2 rounded-lg text-sm hover:bg-blue-500/20 transition-colors flex items-center gap-1.5"
+              >
+                {sincronizandoAcbr ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
+                Testar & Sincronizar ACBr
+              </button>
+              <Link 
+                to={`/empresas/${id}/regras`}
+                className="bg-line-soft border border-line text-ink font-bold px-4 py-2 rounded-lg text-sm hover:bg-i9-tint hover:border-i9 hover:text-i9 transition-colors"
+              >
+                Ver Regras Fiscais
+              </Link>
+            </div>
           )}
         </div>
       </div>
+
 
       <form onSubmit={handleSubmit} className="flex flex-col gap-6">
         {erro && (
@@ -212,6 +325,14 @@ export default function EmpresaForm() {
             {erro}
           </div>
         )}
+
+        {acbrStatusMsg && (
+          <div className="bg-blue-500/10 text-blue-400 border border-blue-500/30 p-3 rounded-lg text-sm font-semibold flex items-center gap-2">
+            <Zap size={16} />
+            {acbrStatusMsg}
+          </div>
+        )}
+
 
         {/* Bloco: Dados Gerais */}
         <div className="bg-card border border-line rounded-DEFAULT shadow p-6">
@@ -296,13 +417,68 @@ export default function EmpresaForm() {
                 <label className="text-xs font-bold text-muted uppercase">CSC Token</label>
                 <input name="csc_token" type="password" value={formData.csc_token} onChange={handleChange} className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none" placeholder={isEditing ? "(Apenas se quiser alterar)" : "Token SEFAZ"} />
               </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-bold text-muted uppercase">Série NF-e (55)</label>
+                  <input
+                    name="serie_nfe"
+                    type="number"
+                    min={1}
+                    max={999}
+                    value={formData.serie_nfe}
+                    onChange={handleChange}
+                    className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-bold text-muted uppercase">Série NFC-e (65)</label>
+                  <input
+                    name="serie_nfce"
+                    type="number"
+                    min={1}
+                    max={999}
+                    value={formData.serie_nfce}
+                    onChange={handleChange}
+                    className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                  />
+                </div>
+              </div>
+              <div className="text-[11px] text-muted -mt-2">
+                Trocar a série reinicia a numeração (nNF) do zero nessa série. Útil para
+                abandonar séries com gaps na sequência sem precisar inutilizar cada número.
+              </div>
             </div>
 
-            <div className="bg-line-soft p-4 rounded-lg flex flex-col gap-4">
-              <div className="text-sm font-bold text-ink flex items-center gap-2"><UploadCloud size={18} className="text-i9" /> Upload Certificado A1 (.pfx)</div>
+            <div className="bg-line-soft p-4 rounded-lg flex flex-col gap-4 relative">
+              <div className="text-sm font-bold text-ink flex items-center gap-2">
+                <UploadCloud size={18} className="text-i9" /> Certificado A1 (.pfx)
+              </div>
               
+              {isEditing && (formData as any).has_certificado && (
+                <div className="mb-2 p-3 bg-white border border-line rounded-lg text-xs flex flex-col gap-1">
+                  <div className="flex justify-between items-center">
+                    <span className="font-bold text-success">Certificado Ativo</span>
+                    { (formData as any).certificado_vencimento && 
+                      <span className="text-muted">Vence em: {new Date((formData as any).certificado_vencimento).toLocaleDateString('pt-BR')}</span>
+                    }
+                  </div>
+                  { (formData as any).certificado_emissor && (
+                    <span className="text-muted truncate" title={(formData as any).certificado_emissor}>
+                      Emissor: {(formData as any).certificado_emissor}
+                    </span>
+                  )}
+                  { (formData as any).certificado_sujeito && (
+                    <span className="text-muted truncate" title={(formData as any).certificado_sujeito}>
+                      Titular: {(formData as any).certificado_sujeito}
+                    </span>
+                  )}
+                </div>
+              )}
+
               <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-bold text-muted uppercase">Arquivo (.pfx ou .p12)</label>
+                <label className="text-xs font-bold text-muted uppercase">
+                  {(formData as any).has_certificado ? "Substituir Arquivo (.pfx)" : "Arquivo (.pfx ou .p12)"}
+                </label>
                 <input type="file" accept=".pfx,.p12" onChange={handleFileChange} className="text-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-i9-tint file:text-i9 hover:file:bg-i9 hover:file:text-white transition-colors cursor-pointer" />
               </div>
 
@@ -315,6 +491,81 @@ export default function EmpresaForm() {
 
           </div>
         </div>
+
+        {/* Bloco: Inutilização de Faixa (Etapa G — só em modo edição) */}
+        {isEditing && (
+          <div className="bg-card border border-line rounded-DEFAULT shadow p-6">
+            <h2 className="text-sm font-bold text-i9 uppercase tracking-wider mb-4 border-b border-line pb-2">
+              Inutilizar Faixa de Numeração
+            </h2>
+            <div className="text-xs text-muted mb-4 leading-relaxed">
+              Declara à SEFAZ que uma faixa de números <strong>não foi usada</strong> e
+              não será usada. Útil pra fechar buracos na sequência sem trocar de série.
+              A SEFAZ limita 999 números por lote — faixas maiores são quebradas
+              automaticamente em vários envios.
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-3">
+              <div className="flex flex-col gap-1.5">
+                <label className="text-xs font-bold text-muted uppercase">Modelo</label>
+                <select
+                  value={inutModelo}
+                  onChange={(e) => setInutModelo(e.target.value as '55' | '65')}
+                  className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                >
+                  <option value="55">NF-e (55)</option>
+                  <option value="65">NFC-e (65)</option>
+                </select>
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <label className="text-xs font-bold text-muted uppercase">Número Inicial</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={inutIni}
+                  onChange={(e) => setInutIni(e.target.value)}
+                  className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                  placeholder="Ex: 60"
+                />
+              </div>
+              <div className="flex flex-col gap-1.5">
+                <label className="text-xs font-bold text-muted uppercase">Número Final</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={inutFin}
+                  onChange={(e) => setInutFin(e.target.value)}
+                  className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                  placeholder="Ex: 70000"
+                />
+              </div>
+              <div className="flex flex-col gap-1.5 justify-end">
+                <button
+                  type="button"
+                  onClick={handleInutilizar}
+                  disabled={inutLoading}
+                  className="flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-bold text-white bg-gradient-to-b from-i9 to-i9-dark shadow-sm hover:opacity-90 disabled:opacity-50 transition-opacity"
+                >
+                  {inutLoading ? <Loader2 size={14} className="animate-spin" /> : null}
+                  {inutLoading ? 'Enviando...' : 'Inutilizar Faixa'}
+                </button>
+              </div>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label className="text-xs font-bold text-muted uppercase">Justificativa (mín. 15 caracteres)</label>
+              <input
+                value={inutJust}
+                onChange={(e) => setInutJust(e.target.value)}
+                className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                placeholder="Ex: Correção de sequência por gap na numeração do sistema emissor"
+              />
+            </div>
+            {inutStatus && (
+              <div className="mt-3 text-xs px-3 py-2 rounded bg-line-soft text-ink-soft">
+                {inutStatus}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="flex justify-end gap-3">
           <Link to="/empresas" className="px-5 py-2.5 rounded-lg text-sm font-bold text-ink-soft bg-field border border-line hover:bg-line-soft transition-colors">

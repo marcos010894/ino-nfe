@@ -14,7 +14,7 @@ def seed():
             from app.api.auth import get_password_hash
             user = Usuario(
                 email="christian.silva@netminas.com.br",
-                senha_hash=get_password_hash("DQMCyE5s8D@5sVY"),
+                senha_hash=get_password_hash("123456"),
                 nome="Christian Silva",
                 criado_em=datetime.utcnow()
             )

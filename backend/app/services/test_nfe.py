@@ -42,7 +42,7 @@ async def test_nfe_flow():
             ],
             "cliente": {
                 "nome": "Adquirente de Joias Teste",
-                "cpf": "11122233344"
+                "cpf": "11144477735"
             }
         }
         

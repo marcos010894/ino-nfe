@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { FileText, Search, Download, ExternalLink, XOctagon, RefreshCw, AlertCircle, Calendar, ShieldCheck, HelpCircle, Eye, Loader2 } from 'lucide-react';
+import { FileText, Download, XOctagon, RefreshCw, AlertCircle, ShieldCheck, HelpCircle, Eye, Loader2 } from 'lucide-react';
 import api from '../../lib/api';
 
 interface Nota {
