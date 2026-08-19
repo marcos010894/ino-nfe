@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import Login from './pages/Login';
 import Cadastro from './pages/Cadastro';
+import SSO from './pages/SSO';
 import Layout from './components/Layout';
 import Home from './pages/dashboard/Home';
 import EmpresasList from './pages/empresas/EmpresasList';
@@ -8,6 +9,7 @@ import EmpresaForm from './pages/empresas/EmpresaForm';
 import RegrasFiscaisList from './pages/empresas/RegrasFiscaisList';
 import RegraFiscalForm from './pages/empresas/RegraFiscalForm';
 import EmitirNota from './pages/empresas/EmitirNota';
+import EmitirDevolucao from './pages/empresas/EmitirDevolucao';
 import CentralDocumentos from './pages/empresas/CentralDocumentos';
 import NotasRecebidas from './pages/documentos/NotasRecebidas';
 import { isAuthenticated } from './lib/auth';
@@ -22,6 +24,9 @@ export default function App() {
       <Routes>
         <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
         <Route path="/cadastro" element={<PublicRoute><Cadastro /></PublicRoute>} />
+        {/* SSO por Token de Integração — não checa autenticação prévia (o próprio
+            fluxo grava o JWT). Se já houver sessão, o token novo sobrescreve. */}
+        <Route path="/sso" element={<SSO />} />
         
         <Route path="/" element={<Layout />}>
           <Route index element={<Home />} />
@@ -32,6 +37,7 @@ export default function App() {
           <Route path="empresas/:id/regras/nova" element={<RegraFiscalForm />} />
           <Route path="empresas/:id/regras/:regraId" element={<RegraFiscalForm />} />
           <Route path="emitir" element={<EmitirNota />} />
+          <Route path="emitir/devolucao" element={<EmitirDevolucao />} />
           <Route path="documentos" element={<CentralDocumentos />} />
           <Route path="documentos/rascunhos" element={<NotasRecebidas />} />
         </Route>

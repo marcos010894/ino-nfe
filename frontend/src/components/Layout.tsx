@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Outlet, Navigate, useNavigate, Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Building2, FileText, Files, LogOut } from 'lucide-react';
+import { LayoutDashboard, Building2, FileText, Files, LogOut, Undo2 } from 'lucide-react';
 import { isAuthenticated, removeToken } from '../lib/auth';
 import api from '../lib/api';
 
@@ -44,6 +44,7 @@ export default function Layout() {
     { name: 'Dashboard', path: '/', icon: <LayoutDashboard size={18} /> },
     { name: 'Empresas', path: '/empresas', icon: <Building2 size={18} /> },
     { name: 'Emitir Nota', path: '/emitir', icon: <FileText size={18} /> },
+    { name: 'Emitir Devolução', path: '/emitir/devolucao', icon: <Undo2 size={18} /> },
     { name: 'Documentos', path: '/documentos', icon: <Files size={18} /> },
     { name: 'Notas Recebidas', path: '/documentos/rascunhos', icon: <FileText size={18} /> },
   ];

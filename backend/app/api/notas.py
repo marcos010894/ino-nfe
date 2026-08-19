@@ -12,9 +12,14 @@ from app.models.empresa import Empresa
 from app.models.regra_fiscal import RegraFiscal
 from app.models.nota import Nota
 from app.models.usuario import Usuario
-from app.schemas.nota import NotaCreate, NotaResponse, NotaCancelar, InutilizacaoRequest
+from app.schemas.nota import (
+    NotaCreate, NotaResponse, NotaCancelar, InutilizacaoRequest,
+    DevolucaoCreate, DevolucaoPreviewResponse,
+)
 from app.api.auth import get_current_user
 from app.services.acbr_api import ACBrAPIService
+from app.services.xml_parser import parse_nfe_xml
+from fastapi import UploadFile, File
 
 router = APIRouter(prefix="/empresas/{empresa_id}/notas", tags=["Notas Fiscais"])
 
@@ -201,6 +206,186 @@ async def criar_e_transmitir_nota(
     session.refresh(nova_nota)
 
     return nova_nota
+
+
+# ------------------------------------------------------------------
+# NF-e de DEVOLUÇÃO (mod 55, finNFe=4)
+# ------------------------------------------------------------------
+
+@router.post("/devolucao/preview", response_model=DevolucaoPreviewResponse)
+async def preview_devolucao_upload(
+    empresa_id: int,
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Recebe o XML da NF-e original e devolve dados prontos pra popular o formulário."""
+    _verificar_empresa(empresa_id, session, current_user)
+    if not file.filename or not file.filename.lower().endswith(".xml"):
+        raise HTTPException(status_code=400, detail="Envie um arquivo .xml")
+    xml_bytes = await file.read()
+    if len(xml_bytes) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="XML acima do limite (2 MB)")
+    try:
+        parsed = parse_nfe_xml(xml_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return parsed
+
+
+@router.get("/devolucao/preview-chave", response_model=DevolucaoPreviewResponse)
+async def preview_devolucao_por_chave(
+    empresa_id: int,
+    chave: str = Query(..., min_length=44, max_length=44),
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Busca uma nota já emitida no InnoFiscal pela chave, baixa XML da ACBr e parseia."""
+    _verificar_empresa(empresa_id, session, current_user)
+    if not chave.isdigit():
+        raise HTTPException(status_code=400, detail="Chave deve ter 44 dígitos numéricos")
+
+    nota = session.exec(
+        select(Nota).where(Nota.chave_acesso == chave, Nota.status == "autorizada")
+    ).first()
+    if not nota or not nota.acbr_id:
+        raise HTTPException(status_code=404, detail="Nota autorizada não encontrada pra essa chave")
+
+    modelo_int = 55
+    if nota.acbr_id.startswith("nfc_"):
+        modelo_int = 65
+    elif nota.acbr_id.startswith("nfe_"):
+        modelo_int = 55
+
+    acbr_service = ACBrAPIService()
+    try:
+        ok, xml_or_err = await acbr_service.baixar_xml(nota.acbr_id, modelo=modelo_int)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Falha ao baixar XML na ACBr: {exc}")
+
+    if not ok or not isinstance(xml_or_err, (bytes, bytearray)):
+        detalhe = xml_or_err if isinstance(xml_or_err, dict) else {"erro": str(xml_or_err)}
+        raise HTTPException(status_code=502, detail=f"ACBr não devolveu XML: {detalhe}")
+
+    try:
+        parsed = parse_nfe_xml(bytes(xml_or_err))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return parsed
+
+
+@router.post("/devolucao", response_model=NotaResponse)
+async def emitir_devolucao(
+    empresa_id: int,
+    dados: DevolucaoCreate,
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Emite NF-e mod 55 com finNFe=4 (devolução) e NFref → chave da nota original."""
+    empresa = _verificar_empresa(empresa_id, session, current_user)
+
+    # Validações
+    if not dados.chave_referenciada.isdigit():
+        raise HTTPException(status_code=400, detail="chave_referenciada deve ter 44 dígitos")
+
+    # Reservar próximo nNF sequencial (mod 55, série da empresa)
+    SERIE_PADRAO = empresa.serie_nfe or 1
+    ultimo_numero = session.exec(
+        select(Nota.numero)
+        .where(
+            Nota.empresa_id == empresa_id,
+            Nota.modelo == "55",
+            Nota.serie == SERIE_PADRAO,
+            Nota.numero.is_not(None),
+        )
+        .order_by(Nota.numero.desc())
+    ).first()
+    proximo_numero = (ultimo_numero or 0) + 1
+
+    # Montar payload
+    acbr_service = ACBrAPIService()
+    try:
+        payload = acbr_service.montar_payload_devolucao(
+            empresa, dados, numero=proximo_numero, serie=SERIE_PADRAO,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao montar payload de devolução: {e}")
+
+    # Localizar nota original no próprio InnoFiscal (opcional)
+    nota_original = session.exec(
+        select(Nota).where(Nota.chave_acesso == dados.chave_referenciada)
+    ).first()
+
+    valor_total = sum(float(i.quantidade) * float(i.valor_unitario) for i in dados.itens)
+
+    nova_nota = Nota(
+        empresa_id=empresa_id,
+        usuario_id=current_user.id,
+        modelo="55",
+        status="processando",
+        valor_total=round(valor_total, 2),
+        json_venda=json.dumps({
+            "chave_referenciada": dados.chave_referenciada,
+            "motivo": dados.motivo,
+            "destinatario": dados.destinatario.model_dump(),
+            "itens": [i.model_dump() for i in dados.itens],
+        }),
+        payload_enviado=json.dumps(payload),
+        numero=proximo_numero,
+        serie=SERIE_PADRAO,
+        finalidade=4,
+        nota_referenciada_chave=dados.chave_referenciada,
+        nota_referenciada_id=(nota_original.id if nota_original else None),
+        natureza_operacao=dados.natureza_operacao,
+        criado_em=datetime.utcnow(),
+        atualizado_em=datetime.utcnow(),
+    )
+    session.add(nova_nota)
+    session.commit()
+    session.refresh(nova_nota)
+
+    # Transmitir
+    status, resposta = await acbr_service.transmitir_nfe(payload)
+
+    nova_nota.status = status
+    nova_nota.resposta_integradora = json.dumps(resposta)
+    nova_nota.atualizado_em = datetime.utcnow()
+
+    if status == "autorizada":
+        nova_nota.acbr_id = resposta.get("id")
+        nova_nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso")
+        nova_nota.numero = resposta.get("numero") or resposta.get("numeroNota") or proximo_numero
+        nova_nota.serie = resposta.get("serie") or SERIE_PADRAO
+        nova_nota.pdf_url = f"/empresas/{empresa_id}/notas/{nova_nota.id}/pdf"
+        nova_nota.xml_url = f"/empresas/{empresa_id}/notas/{nova_nota.id}/xml"
+    elif status == "processando":
+        nova_nota.acbr_id = resposta.get("id")
+        nova_nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso") or payload.get("referencia")
+        nova_nota.pdf_url = f"/empresas/{empresa_id}/notas/{nova_nota.id}/pdf"
+        nova_nota.xml_url = f"/empresas/{empresa_id}/notas/{nova_nota.id}/xml"
+    else:
+        aut = resposta.get("autorizacao") or {}
+        err = resposta.get("error") or {}
+        motivo = (
+            aut.get("motivo_status")
+            or resposta.get("motivo_status")
+            or err.get("message")
+            or resposta.get("motivo")
+            or resposta.get("mensagem")
+            or (resposta.get("erro") if isinstance(resposta.get("erro"), str) else None)
+            or "Rejeição desconhecida"
+        )
+        cstat = aut.get("codigo_status") or resposta.get("codigo_status") or err.get("code")
+        resposta = {**resposta, "motivo_status": motivo, "codigo_status": cstat}
+        nova_nota.resposta_integradora = json.dumps(resposta)
+        nova_nota.acbr_id = resposta.get("id")
+        nova_nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso")
+
+    session.add(nova_nota)
+    session.commit()
+    session.refresh(nova_nota)
+    return nova_nota
+
 
 @router.post("/{nota_id}/cancelar", response_model=NotaResponse)
 async def cancelar_nota(

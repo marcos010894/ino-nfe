@@ -22,6 +22,12 @@ class Nota(SQLModel, table=True):
     
     xml_url: Optional[str] = None
     pdf_url: Optional[str] = None
-    
+
+    # Devolução (finNFe=4). NULL = emissão normal (retro-compat).
+    finalidade: Optional[int] = Field(default=None)  # 1=normal, 2=complementar, 3=ajuste, 4=devolução
+    nota_referenciada_chave: Optional[str] = Field(default=None, max_length=44)
+    nota_referenciada_id: Optional[int] = Field(default=None)
+    natureza_operacao: Optional[str] = Field(default=None, max_length=120)
+
     criado_em: datetime = Field(default_factory=datetime.utcnow)
     atualizado_em: datetime = Field(default_factory=datetime.utcnow)

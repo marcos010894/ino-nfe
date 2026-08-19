@@ -522,6 +522,7 @@ class ACBrAPIService:
         tot_v_ibs_uf = 0.0
         tot_v_ibs_mun = 0.0
         tot_v_is = 0.0
+        tot_v_tot_trib = 0.0
 
         det = []
         for i, item in enumerate(itens_venda, start=1):
@@ -559,12 +560,14 @@ class ACBrAPIService:
             pis_group = self._resolver_pis(regra.pis_cst, float(regra.pis_aliquota or 0.0), v_item_prod)
             cofins_group = self._resolver_cofins(regra.cofins_cst, float(regra.cofins_aliquota or 0.0), v_item_prod)
 
+            v_tot_trib_item = _r(v_item_prod * 0.15)
             imposto: Dict[str, Any] = {
-                "vTotTrib": _r(v_item_prod * 0.15),
+                "vTotTrib": v_tot_trib_item,
                 "ICMS": icms_group,
                 "PIS": pis_group,
                 "COFINS": cofins_group,
             }
+            tot_v_tot_trib += v_tot_trib_item
             ipi = self._resolver_ipi(regra, v_item_prod)
             if ipi:
                 imposto["IPI"] = ipi
@@ -764,7 +767,7 @@ class ACBrAPIService:
                         "vCOFINS": _r(tot_v_cofins),
                         "vOutro": 0.0,
                         "vNF": v_nf,
-                        "vTotTrib": _r(v_prod * 0.15),
+                        "vTotTrib": _r(tot_v_tot_trib),
                     },
                 },
                 "transp": {"modFrete": 9},
@@ -774,6 +777,251 @@ class ACBrAPIService:
 
         if dest:
             payload["infNFe"]["dest"] = dest
+
+        return payload
+
+    # ------------------------------------------------------------------
+    # Payload de NF-e de DEVOLUÇÃO (mod 55, finNFe=4)
+    # ------------------------------------------------------------------
+    def _icms_devolucao(self, cst_csosn: str, aliquota: float, valor_item: float) -> Dict[str, Any]:
+        """Monta o grupo ICMS pra devolução usando CST/CSOSN + alíquota espelhados do XML.
+
+        Difere de _resolver_icms (que puxa tudo de RegraFiscal): aqui os
+        campos vêm por-item, sem regra fiscal envolvida.
+        """
+        cst_csosn = (cst_csosn or "").strip()
+        base = _r(valor_item)
+        v_icms = _r(base * (aliquota / 100.0)) if aliquota else 0.0
+
+        # Simples Nacional (CSOSN 3 dígitos)
+        if len(cst_csosn) == 3:
+            if cst_csosn == "101":
+                return {"ICMSSN101": {"orig": 0, "CSOSN": cst_csosn,
+                                       "pCredSN": aliquota, "vCredICMSSN": v_icms}}
+            if cst_csosn in ("102", "103", "300", "400", "500", "900"):
+                return {"ICMSSN102": {"orig": 0, "CSOSN": cst_csosn}}
+            return {"ICMSSN102": {"orig": 0, "CSOSN": cst_csosn}}
+
+        # Regime normal (CST 2 dígitos)
+        if cst_csosn == "00":
+            return {"ICMS00": {"orig": 0, "CST": "00", "modBC": 3,
+                                "vBC": base, "pICMS": aliquota, "vICMS": v_icms}}
+        if cst_csosn in ("40", "41", "50"):
+            return {"ICMS40": {"orig": 0, "CST": cst_csosn}}
+        if cst_csosn == "60":
+            return {"ICMS60": {"orig": 0, "CST": "60",
+                                "vBCSTRet": 0.0, "vICMSSTRet": 0.0}}
+        # fallback conservador
+        return {"ICMS40": {"orig": 0, "CST": cst_csosn or "40"}}
+
+    def montar_payload_devolucao(
+        self,
+        empresa: Empresa,
+        dados: Any,
+        numero: int,
+        serie: int = 1,
+    ) -> Dict[str, Any]:
+        """Monta o payload NF-e mod 55 com finNFe=4 (devolução) + NFref.
+
+        `dados` é um DevolucaoCreate. Tributos vêm por item, não de RegraFiscal.
+        """
+        itens_dev = dados.itens
+        v_prod = sum(float(it.quantidade) * float(it.valor_unitario) for it in itens_dev)
+        v_nf_base = _r(v_prod)
+
+        c_nf = str(random.randint(10000000, 99999999))
+
+        tot_v_bc = 0.0
+        tot_v_icms = 0.0
+        tot_v_pis = 0.0
+        tot_v_cofins = 0.0
+        tot_v_tot_trib = 0.0
+
+        det = []
+        for i, item in enumerate(itens_dev, start=1):
+            qtd = float(item.quantidade)
+            v_un = float(item.valor_unitario)
+            v_item_prod = _r(qtd * v_un)
+
+            ncm = "".join(filter(str.isdigit, item.ncm or ""))[:8]
+            cfop = "".join(filter(str.isdigit, item.cfop or ""))[:4]
+
+            prod: Dict[str, Any] = {
+                "cProd": item.codigo or f"PROD{i}",
+                "cEAN": "SEM GTIN",
+                "cEANTrib": "SEM GTIN",
+                "xProd": (item.descricao or "Item sem Nome").upper(),
+                "NCM": ncm,
+                "CFOP": cfop,
+                "uCom": (item.unidade or "UN").upper(),
+                "qCom": qtd,
+                "vUnCom": v_un,
+                "vProd": v_item_prod,
+                "uTrib": (item.unidade or "UN").upper(),
+                "qTrib": qtd,
+                "vUnTrib": v_un,
+                "indTot": 1,
+            }
+
+            icms_group = self._icms_devolucao(item.cst_csosn, float(item.icms_aliquota or 0.0), v_item_prod)
+            pis_group = self._resolver_pis(item.pis_cst or "07", float(item.pis_aliquota or 0.0), v_item_prod)
+            cofins_group = self._resolver_cofins(item.cofins_cst or "07", float(item.cofins_aliquota or 0.0), v_item_prod)
+
+            v_tot_trib_item = _r(v_item_prod * 0.15)
+            imposto: Dict[str, Any] = {
+                "vTotTrib": v_tot_trib_item,
+                "ICMS": icms_group,
+                "PIS": pis_group,
+                "COFINS": cofins_group,
+            }
+            tot_v_tot_trib += v_tot_trib_item
+
+            det.append({"nItem": i, "prod": prod, "imposto": imposto})
+
+            inner = next(iter(icms_group.values()))
+            tot_v_bc += float(inner.get("vBC", 0.0) or 0.0)
+            tot_v_icms += float(inner.get("vICMS", 0.0) or 0.0)
+            for key in ("PISAliq", "PISOutr", "PISQtde"):
+                if key in pis_group:
+                    tot_v_pis += float(pis_group[key].get("vPIS", 0.0) or 0.0)
+            for key in ("COFINSAliq", "COFINSOutr", "COFINSQtde"):
+                if key in cofins_group:
+                    tot_v_cofins += float(cofins_group[key].get("vCOFINS", 0.0) or 0.0)
+
+        crt = 1
+        if hasattr(empresa, "regime_tributario") and empresa.regime_tributario:
+            if "Normal" in empresa.regime_tributario:
+                crt = 3
+
+        cod_mun_uf = getattr(empresa, "codigo_municipio", None) or "3550308"
+        uf_emit = (empresa.uf or "SP").upper()
+        uf_codes = {
+            "AC": 12, "AL": 27, "AM": 13, "AP": 16, "BA": 29, "CE": 23, "DF": 53, "ES": 32, "GO": 52,
+            "MA": 21, "MG": 31, "MS": 50, "MT": 51, "PA": 15, "PB": 25, "PE": 26, "PI": 22, "PR": 41,
+            "RJ": 33, "RN": 24, "RO": 11, "RR": 14, "RS": 43, "SC": 42, "SE": 28, "SP": 35, "TO": 17,
+        }
+        c_uf = uf_codes.get(uf_emit, 35)
+
+        # Destinatário da devolução
+        d = dados.destinatario
+        cpf = "".join(filter(str.isdigit, d.cpf or ""))
+        cnpj_cli = "".join(filter(str.isdigit, d.cnpj or ""))
+        dest: Dict[str, Any] = {"xNome": (d.nome or "DESTINATARIO").upper(), "indIEDest": 9}
+        if cnpj_cli and len(cnpj_cli) == 14:
+            dest = {"CNPJ": cnpj_cli, **dest}
+            # Se IE é fornecida e diferente de ISENTO, indIEDest=1 (contribuinte)
+            ie_norm = (d.ie or "").strip().upper()
+            if ie_norm and ie_norm != "ISENTO":
+                dest["indIEDest"] = 1
+                dest["IE"] = "".join(filter(str.isdigit, ie_norm))
+            else:
+                dest["indIEDest"] = 9
+        elif cpf and len(cpf) == 11:
+            dest = {"CPF": cpf, **dest}
+        else:
+            # Devolução exige destinatário identificado
+            dest = {"CNPJ": "00000000000000", **dest}
+
+        # NF-e mod 55 exige enderDest (cStat 726)
+        ender_dest = {
+            "xLgr": (d.logradouro or "NAO INFORMADO").upper()[:60],
+            "nro": str(d.numero or "SN")[:60],
+            "xBairro": (d.bairro or "NAO INFORMADO").upper()[:60],
+            "cMun": d.codigo_municipio or cod_mun_uf,
+            "xMun": (d.municipio or empresa.cidade or "NAO INFORMADO").upper()[:60],
+            "UF": (d.uf or uf_emit).upper(),
+            "CEP": "".join(filter(str.isdigit, d.cep or empresa.cep or "")),
+            "cPais": 1058,
+            "xPais": "BRASIL",
+        }
+        if d.complemento:
+            ender_dest["xCpl"] = str(d.complemento).upper()[:60]
+        dest["enderDest"] = ender_dest
+
+        v_nf = _r(v_nf_base)
+
+        payload: Dict[str, Any] = {
+            "ambiente": "homologacao" if self.env != "producao" else "producao",
+            "referencia": str(uuid.uuid4()),
+            "infNFe": {
+                "versao": "4.00",
+                "ide": {
+                    "cUF": c_uf,
+                    "cNF": c_nf,
+                    "natOp": (dados.natureza_operacao or "DEVOLUCAO DE MERCADORIA")[:60],
+                    "mod": 55,
+                    "serie": serie,
+                    "nNF": numero,
+                    "dhEmi": datetime.now(timezone(timedelta(hours=-3))).isoformat(timespec="seconds"),
+                    "tpNF": 1,
+                    "idDest": 1,
+                    "cMunFG": cod_mun_uf,
+                    "tpImp": 1,
+                    "tpEmis": 1,
+                    "tpAmb": 2 if self.env != "producao" else 1,
+                    "finNFe": 4,  # devolução
+                    "indFinal": 0,
+                    "indPres": 1,
+                    "procEmi": 0,
+                    "verProc": "1.0.0",
+                },
+                # NFref: aponta pra chave da NF-e original que está sendo devolvida
+                "NFref": [{"refNFe": dados.chave_referenciada}],
+                "emit": {
+                    "CNPJ": "".join(filter(str.isdigit, empresa.cnpj)),
+                    "xNome": empresa.razao_social.upper(),
+                    "xFant": (empresa.nome_fantasia or empresa.razao_social).upper(),
+                    "enderEmit": {
+                        "xLgr": (empresa.logradouro or "RUA DO EMISSOR").upper(),
+                        "nro": empresa.numero or "SN",
+                        "xBairro": (empresa.bairro or "CENTRO").upper(),
+                        "cMun": cod_mun_uf,
+                        "xMun": (empresa.cidade or "SAO PAULO").upper(),
+                        "UF": uf_emit,
+                        "CEP": "".join(filter(str.isdigit, empresa.cep or "01001000")),
+                        "cPais": "1058",
+                        "xPais": "BRASIL",
+                    },
+                    "IE": (empresa.inscricao_estadual.strip().upper()
+                           if (empresa.inscricao_estadual or "").strip().upper() == "ISENTO"
+                           else "".join(filter(str.isdigit, empresa.inscricao_estadual or "")) or "ISENTO"),
+                    "CRT": crt,
+                },
+                "dest": dest,
+                "det": det,
+                "total": {
+                    "ICMSTot": {
+                        "vBC": _r(tot_v_bc),
+                        "vICMS": _r(tot_v_icms),
+                        "vICMSDeson": 0.0,
+                        "vFCPUFDest": 0.0,
+                        "vICMSUFDest": 0.0,
+                        "vICMSUFRemet": 0.0,
+                        "vFCP": 0.0,
+                        "vBCST": 0.0,
+                        "vST": 0.0,
+                        "vFCPST": 0.0,
+                        "vFCPSTRet": 0.0,
+                        "vProd": _r(v_prod),
+                        "vFrete": 0.0,
+                        "vSeg": 0.0,
+                        "vDesc": 0.0,
+                        "vII": 0.0,
+                        "vIPI": 0.0,
+                        "vIPIDevol": 0.0,
+                        "vPIS": _r(tot_v_pis),
+                        "vCOFINS": _r(tot_v_cofins),
+                        "vOutro": 0.0,
+                        "vNF": v_nf,
+                        "vTotTrib": _r(tot_v_tot_trib),
+                    },
+                },
+                "transp": {"modFrete": 9},
+                # Devolução sem pagamento associado — tPag=90 (sem pagamento)
+                "pag": {"detPag": [{"indPag": 0, "tPag": "90", "vPag": v_nf}]},
+                "infAdic": {"infCpl": (dados.motivo or "")[:5000]},
+            },
+        }
 
         return payload
 
