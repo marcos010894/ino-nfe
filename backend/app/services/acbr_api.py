@@ -973,34 +973,46 @@ class ACBrAPIService:
         else:
             id_dest = 1
 
+        # tpNF: 0=entrada (devolução de venda), 1=saída (devolução de compra)
+        # Auto-detecta pelo primeiro dígito do CFOP dos itens.
+        # CFOPs 1xxx/2xxx/3xxx = entrada; 5xxx/6xxx/7xxx = saída.
+        primeiro_cfop = (itens_dev[0].cfop or "").strip() if itens_dev else ""
+        if primeiro_cfop and primeiro_cfop[0] in ("1", "2", "3"):
+            tp_nf = 0  # entrada (devolução de venda)
+        else:
+            tp_nf = 1  # saída (devolução de compra)
+
+        ide: Dict[str, Any] = {
+            "cUF": c_uf,
+            "cNF": c_nf,
+            "natOp": (dados.natureza_operacao or "DEVOLUCAO DE MERCADORIA")[:60],
+            "mod": 55,
+            "serie": serie,
+            "nNF": numero,
+            "dhEmi": agora,
+            "tpNF": tp_nf,
+            "idDest": id_dest,
+            "cMunFG": cod_mun_uf,
+            "tpImp": 1,
+            "tpEmis": 1,
+            "tpAmb": 2 if self.env != "producao" else 1,
+            "finNFe": 4,  # devolução
+            "indFinal": 0,
+            "indPres": 1,
+            "procEmi": 0,
+            "verProc": "1.0.0",
+            # NFref: filho de <ide> na estrutura NF-e 4.0 (não de infNFe)
+            "NFref": [{"refNFe": chave_ref}],
+        }
+        # dhSaiEnt: recomendado enviar (data de saída ou entrada conforme tpNF)
+        ide["dhSaiEnt"] = agora
+
         payload: Dict[str, Any] = {
             "ambiente": "homologacao" if self.env != "producao" else "producao",
             "referencia": str(uuid.uuid4()),
             "infNFe": {
                 "versao": "4.00",
-                "ide": {
-                    "cUF": c_uf,
-                    "cNF": c_nf,
-                    "natOp": (dados.natureza_operacao or "DEVOLUCAO DE MERCADORIA")[:60],
-                    "mod": 55,
-                    "serie": serie,
-                    "nNF": numero,
-                    "dhEmi": agora,
-                    "dhSaiEnt": agora,  # tpNF=1 (saída) → recomendado enviar data de saída
-                    "tpNF": 1,
-                    "idDest": id_dest,
-                    "cMunFG": cod_mun_uf,
-                    "tpImp": 1,
-                    "tpEmis": 1,
-                    "tpAmb": 2 if self.env != "producao" else 1,
-                    "finNFe": 4,  # devolução
-                    "indFinal": 0,
-                    "indPres": 1,
-                    "procEmi": 0,
-                    "verProc": "1.0.0",
-                    # NFref: filho de <ide> na estrutura NF-e 4.0 (não de infNFe)
-                    "NFref": [{"refNFe": chave_ref}],
-                },
+                "ide": ide,
                 "emit": {
                     "CNPJ": "".join(filter(str.isdigit, empresa.cnpj)),
                     "xNome": empresa.razao_social.upper(),
@@ -1051,8 +1063,9 @@ class ACBrAPIService:
                     },
                 },
                 "transp": {"modFrete": 9},
-                # Devolução sem pagamento associado — tPag=90 (sem pagamento)
-                "pag": {"detPag": [{"indPag": 0, "tPag": "90", "vPag": v_nf}]},
+                # Devolução sem pagamento associado — tPag=90 (sem pagamento).
+                # vPag=0 em tPag=90 (cStat 904 rejeita se vPag > 0).
+                "pag": {"detPag": [{"tPag": "90", "vPag": 0.0}]},
                 "infAdic": {
                     "infCpl": (
                         f"NF-E DE DEVOLUCAO REF. CHAVE {chave_ref}. "
