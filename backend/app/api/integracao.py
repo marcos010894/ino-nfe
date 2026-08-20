@@ -223,6 +223,7 @@ async def obter_rascunho(
 
 @router.get("/notas", response_model=List[NotaIntegracaoResponse])
 async def listar_notas_integracao(
+    ids: Optional[str] = Query(None, description="Lista de ids separados por vírgula (ex: 1,2,3). Ignora demais filtros de listagem."),
     status: Optional[str] = Query(None, description="Filtra por status: rascunho, processando, autorizada, rejeitada, cancelada"),
     modelo: Optional[str] = Query(None, description="Filtra por modelo: 55 (NF-e) ou 65 (NFC-e)"),
     empresa_id: Optional[int] = Query(None, description="Filtra por empresa emissora"),
@@ -232,18 +233,37 @@ async def listar_notas_integracao(
     session: Session = Depends(get_session),
 ):
     """
-    Lista todas as notas do usuário identificado pelo X-API-Key, com filtros
-    opcionais. Retorna status, chave, valores, motivo de rejeição (extraído da
-    resposta da SEFAZ) e URLs de XML/PDF. Ordenado por criado_em desc.
+    Lista notas do usuário identificado pelo X-API-Key.
+
+    Uso comum:
+    - `?ids=1,2,3` → polling em lote de ids conhecidos (ex: rascunhos que
+      viraram nota autorizada). Retorna só os que existem e pertencem ao
+      usuário; máximo 200 ids por chamada.
+    - `?status=autorizada&limit=50` → notas recém autorizadas.
+
+    Retorna status atual, chave, número, série, motivo de rejeição e URLs
+    de XML/PDF. Ordenado por criado_em desc.
     """
     query = select(Nota).where(Nota.usuario_id == usuario.id)
-    if status:
-        query = query.where(Nota.status == status)
-    if modelo:
-        query = query.where(Nota.modelo == modelo)
-    if empresa_id is not None:
-        query = query.where(Nota.empresa_id == empresa_id)
-    query = query.order_by(Nota.criado_em.desc()).offset(offset).limit(limit)
+
+    if ids:
+        try:
+            id_list = [int(x) for x in ids.split(",") if x.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Parâmetro 'ids' deve ser uma lista de inteiros separados por vírgula.")
+        if len(id_list) > 200:
+            raise HTTPException(status_code=400, detail="Máximo de 200 ids por chamada.")
+        if not id_list:
+            return []
+        query = query.where(Nota.id.in_(id_list)).order_by(Nota.criado_em.desc())
+    else:
+        if status:
+            query = query.where(Nota.status == status)
+        if modelo:
+            query = query.where(Nota.modelo == modelo)
+        if empresa_id is not None:
+            query = query.where(Nota.empresa_id == empresa_id)
+        query = query.order_by(Nota.criado_em.desc()).offset(offset).limit(limit)
 
     notas = session.exec(query).all()
     return [_nota_para_response(n) for n in notas]
