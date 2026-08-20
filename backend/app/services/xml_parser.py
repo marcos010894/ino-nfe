@@ -146,6 +146,32 @@ def _extrair_itens(root: ET.Element) -> list:
                     if cofins_cst:
                         break
 
+        # IPI — só existe em nota de Regime Normal com IPI destacado
+        # Na devolução o CST vira 49 (retorno de mercadoria).
+        ipi_cst = None
+        ipi_aliq = None
+        ipi_enq = None
+        if imposto is not None:
+            ipi_node = imposto.find("n:IPI", NS)
+            if ipi_node is not None:
+                ipi_enq = ipi_node.findtext("n:cEnq", namespaces=NS)
+                for grupo_name in ("IPITrib", "IPINT"):
+                    grupo = ipi_node.find(f"n:{grupo_name}", NS)
+                    if grupo is not None:
+                        orig_cst = grupo.findtext("n:CST", namespaces=NS)
+                        # Devolução: CST vira 49 se original era tributado (00/50/99)
+                        if orig_cst in ("00", "50", "99"):
+                            ipi_cst = "49"
+                        else:
+                            ipi_cst = orig_cst
+                        aliq = grupo.findtext("n:pIPI", namespaces=NS)
+                        if aliq:
+                            try:
+                                ipi_aliq = float(aliq)
+                            except ValueError:
+                                pass
+                        break
+
         itens.append({
             "codigo": _text(prod, "n:cProd") or "",
             "descricao": _text(prod, "n:xProd") or "",
@@ -160,6 +186,9 @@ def _extrair_itens(root: ET.Element) -> list:
             "pis_aliquota": pis_aliq,
             "cofins_cst": cofins_cst,
             "cofins_aliquota": cofins_aliq,
+            "ipi_cst": ipi_cst,
+            "ipi_aliquota": ipi_aliq,
+            "ipi_enquadramento": ipi_enq,
         })
     return itens
 

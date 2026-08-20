@@ -116,6 +116,10 @@ class DevolucaoItemInput(BaseModel):
     pis_aliquota: Optional[float] = None
     cofins_cst: Optional[str] = None
     cofins_aliquota: Optional[float] = None
+    # IPI (só se a nota original destacou — Regime Normal com IPI)
+    ipi_cst: Optional[str] = None
+    ipi_aliquota: Optional[float] = None
+    ipi_enquadramento: Optional[str] = None  # cEnq (default "999")
 
 
 class DevolucaoCreate(BaseModel):

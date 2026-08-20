@@ -831,10 +831,15 @@ class ACBrAPIService:
 
         c_nf = str(random.randint(10000000, 99999999))
 
+        # Chave da nota original: só dígitos, 44 caracteres exatos
+        chave_ref = "".join(filter(str.isdigit, dados.chave_referenciada or ""))
+
         tot_v_bc = 0.0
         tot_v_icms = 0.0
         tot_v_pis = 0.0
         tot_v_cofins = 0.0
+        tot_v_ipi = 0.0
+        tot_v_ipi_devol = 0.0
         tot_v_tot_trib = 0.0
 
         det = []
@@ -874,6 +879,25 @@ class ACBrAPIService:
                 "PIS": pis_group,
                 "COFINS": cofins_group,
             }
+
+            # IPI: só espelha se a nota original destacou (Regime Normal com IPI)
+            ipi_cst = (getattr(item, "ipi_cst", None) or "").strip()
+            if ipi_cst:
+                ipi_aliq = float(getattr(item, "ipi_aliquota", None) or 0.0)
+                v_ipi_item = _r(v_item_prod * (ipi_aliq / 100.0)) if ipi_aliq else 0.0
+                c_enq = getattr(item, "ipi_enquadramento", None) or "999"
+                # CST de devolução (49/52/53/54/55) vai em IPINT; tributados (50/99) em IPITrib
+                if ipi_cst in ("00", "49", "50", "99"):
+                    ipi_trib = {"CST": ipi_cst, "vBC": v_item_prod, "pIPI": ipi_aliq, "vIPI": v_ipi_item}
+                    imposto["IPI"] = {"cEnq": c_enq, "IPITrib": ipi_trib}
+                    # Devolução: valor vai em vIPIDevol no total (não vIPI)
+                    if ipi_cst == "49":
+                        tot_v_ipi_devol += v_ipi_item
+                    else:
+                        tot_v_ipi += v_ipi_item
+                else:
+                    imposto["IPI"] = {"cEnq": c_enq, "IPINT": {"CST": ipi_cst}}
+
             tot_v_tot_trib += v_tot_trib_item
 
             det.append({"nItem": i, "prod": prod, "imposto": imposto})
@@ -938,7 +962,16 @@ class ACBrAPIService:
             ender_dest["xCpl"] = str(d.complemento).upper()[:60]
         dest["enderDest"] = ender_dest
 
-        v_nf = _r(v_nf_base)
+        v_nf = _r(v_nf_base + tot_v_ipi)  # IPI tributado (não devolução) soma no vNF
+
+        agora = datetime.now(timezone(timedelta(hours=-3))).isoformat(timespec="seconds")
+
+        # idDest: 1=operação interna, 2=interestadual, 3=exterior
+        uf_dest = ((dados.destinatario.uf or uf_emit) or "").upper()
+        if uf_dest and uf_dest != uf_emit:
+            id_dest = 2
+        else:
+            id_dest = 1
 
         payload: Dict[str, Any] = {
             "ambiente": "homologacao" if self.env != "producao" else "producao",
@@ -952,9 +985,10 @@ class ACBrAPIService:
                     "mod": 55,
                     "serie": serie,
                     "nNF": numero,
-                    "dhEmi": datetime.now(timezone(timedelta(hours=-3))).isoformat(timespec="seconds"),
+                    "dhEmi": agora,
+                    "dhSaiEnt": agora,  # tpNF=1 (saída) → recomendado enviar data de saída
                     "tpNF": 1,
-                    "idDest": 1,
+                    "idDest": id_dest,
                     "cMunFG": cod_mun_uf,
                     "tpImp": 1,
                     "tpEmis": 1,
@@ -964,9 +998,9 @@ class ACBrAPIService:
                     "indPres": 1,
                     "procEmi": 0,
                     "verProc": "1.0.0",
+                    # NFref: filho de <ide> na estrutura NF-e 4.0 (não de infNFe)
+                    "NFref": [{"refNFe": chave_ref}],
                 },
-                # NFref: aponta pra chave da NF-e original que está sendo devolvida
-                "NFref": [{"refNFe": dados.chave_referenciada}],
                 "emit": {
                     "CNPJ": "".join(filter(str.isdigit, empresa.cnpj)),
                     "xNome": empresa.razao_social.upper(),
@@ -1007,8 +1041,8 @@ class ACBrAPIService:
                         "vSeg": 0.0,
                         "vDesc": 0.0,
                         "vII": 0.0,
-                        "vIPI": 0.0,
-                        "vIPIDevol": 0.0,
+                        "vIPI": _r(tot_v_ipi),
+                        "vIPIDevol": _r(tot_v_ipi_devol),
                         "vPIS": _r(tot_v_pis),
                         "vCOFINS": _r(tot_v_cofins),
                         "vOutro": 0.0,
@@ -1019,7 +1053,12 @@ class ACBrAPIService:
                 "transp": {"modFrete": 9},
                 # Devolução sem pagamento associado — tPag=90 (sem pagamento)
                 "pag": {"detPag": [{"indPag": 0, "tPag": "90", "vPag": v_nf}]},
-                "infAdic": {"infCpl": (dados.motivo or "")[:5000]},
+                "infAdic": {
+                    "infCpl": (
+                        f"NF-E DE DEVOLUCAO REF. CHAVE {chave_ref}. "
+                        f"{(dados.motivo or '').strip()}"
+                    )[:5000],
+                },
             },
         }
 
