@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Upload, KeyRound, Pencil, Plus, Trash2, Play, CheckCircle2, XCircle, Loader2, Download, ExternalLink } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Upload, KeyRound, Pencil, Plus, Trash2, Play, CheckCircle2, XCircle, Loader2, Download, ExternalLink, Settings } from 'lucide-react';
 import api from '../../lib/api';
 
 interface Empresa {
@@ -236,19 +237,35 @@ export default function EmitirDevolucao() {
 
       {/* Empresa */}
       <div className="bg-card border border-line rounded-xl p-5">
-        <label className="text-sm font-bold text-ink mb-2 block">Empresa emissora</label>
-        <select
-          value={empresaSelecionada}
-          onChange={e => setEmpresaSelecionada(e.target.value)}
-          className="w-full px-3 py-2 border border-line rounded-lg bg-white text-sm"
-        >
-          <option value="">Selecione...</option>
-          {empresas.map(e => (
-            <option key={e.id} value={e.id}>
-              {e.razao_social} — {e.cnpj}
-            </option>
-          ))}
-        </select>
+        <div className="flex items-end gap-3">
+          <div className="flex-1">
+            <label className="text-sm font-bold text-ink mb-2 block">Empresa emissora</label>
+            <select
+              value={empresaSelecionada}
+              onChange={e => setEmpresaSelecionada(e.target.value)}
+              className="w-full px-3 py-2 border border-line rounded-lg bg-white text-sm"
+            >
+              <option value="">Selecione...</option>
+              {empresas.map(e => (
+                <option key={e.id} value={e.id}>
+                  {e.razao_social} — {e.cnpj}
+                </option>
+              ))}
+            </select>
+          </div>
+          {empresaSelecionada && (
+            <Link
+              to={`/empresas/${empresaSelecionada}/regras`}
+              title="Ajustar CFOP, CST/CSOSN, alíquotas e demais regras fiscais dessa empresa"
+              className="inline-flex items-center gap-2 px-4 py-2 border border-line rounded-lg text-sm text-ink hover:bg-line/30 transition whitespace-nowrap"
+            >
+              <Settings size={16} /> Regras fiscais
+            </Link>
+          )}
+        </div>
+        <p className="text-xs text-muted mt-2">
+          Antes de emitir uma devolução, confirme se as regras fiscais dessa empresa (CFOP, CST/CSOSN, alíquotas) estão atualizadas.
+        </p>
       </div>
 
       {/* Passo 1: Origem */}
