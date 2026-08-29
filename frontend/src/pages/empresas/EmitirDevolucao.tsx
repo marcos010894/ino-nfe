@@ -8,7 +8,20 @@ interface Empresa {
   razao_social: string;
   nome_fantasia: string;
   cnpj: string;
+  uf?: string;
 }
+
+type ClasseCfop = 'auto' | '1' | '2' | '3' | '5' | '6' | '7';
+
+const CLASSES_CFOP: { valor: ClasseCfop; label: string; hint: string }[] = [
+  { valor: 'auto', label: 'Automático pela UF do destinatário',           hint: 'Compara UF da empresa com UF do destinatário. Sempre entrada (1xxx interna / 2xxx interestadual).' },
+  { valor: '1',    label: '1xxx — Entrada · Interna (mesma UF)',           hint: 'Cliente devolveu pra loja, mesma UF.' },
+  { valor: '2',    label: '2xxx — Entrada · Interestadual (UFs diferentes)', hint: 'Cliente devolveu pra loja, outra UF.' },
+  { valor: '3',    label: '3xxx — Entrada · Exterior',                     hint: 'Devolução de importação recebida.' },
+  { valor: '5',    label: '5xxx — Saída · Interna',                        hint: 'Loja devolve pro fornecedor, mesma UF.' },
+  { valor: '6',    label: '6xxx — Saída · Interestadual',                  hint: 'Loja devolve pro fornecedor, outra UF.' },
+  { valor: '7',    label: '7xxx — Saída · Exterior',                       hint: 'Devolução de mercadoria pra fornecedor no exterior.' },
+];
 
 interface Destinatario {
   cpf?: string;
@@ -41,6 +54,24 @@ interface ItemDevolucao {
   cofins_aliquota?: number | null;
 }
 
+interface Transporte {
+  mod_frete: number;  // 0=CIF, 1=FOB, 2=terceiros, 3=próprio emit, 4=próprio dest, 9=sem frete
+  transportador_cnpj?: string;
+  transportador_cpf?: string;
+  transportador_nome?: string;
+  transportador_ie?: string;
+  transportador_endereco?: string;
+  transportador_municipio?: string;
+  transportador_uf?: string;
+  veiculo_placa?: string;
+  veiculo_uf?: string;
+  veiculo_rntc?: string;
+  volume_qtd?: number | null;
+  volume_especie?: string;
+  volume_peso_liquido?: number | null;
+  volume_peso_bruto?: number | null;
+}
+
 type Origem = 'upload' | 'chave' | 'manual';
 
 function extrairMotivoRejeicao(r: any): string {
@@ -67,6 +98,23 @@ const destinatarioVazio: Destinatario = {
   cep: '', municipio: '', codigo_municipio: '', uf: '',
 };
 
+const transporteVazio: Transporte = {
+  mod_frete: 9,
+  transportador_cnpj: '', transportador_cpf: '', transportador_nome: '', transportador_ie: '',
+  transportador_endereco: '', transportador_municipio: '', transportador_uf: '',
+  veiculo_placa: '', veiculo_uf: '', veiculo_rntc: '',
+  volume_qtd: null, volume_especie: '', volume_peso_liquido: null, volume_peso_bruto: null,
+};
+
+const MOD_FRETE_OPCOES = [
+  { valor: 9, label: '9 — Sem frete' },
+  { valor: 0, label: '0 — Por conta do emitente (CIF)' },
+  { valor: 1, label: '1 — Por conta do destinatário (FOB)' },
+  { valor: 2, label: '2 — Por conta de terceiros' },
+  { valor: 3, label: '3 — Próprio do remetente' },
+  { valor: 4, label: '4 — Próprio do destinatário' },
+];
+
 export default function EmitirDevolucao() {
   const [empresas, setEmpresas] = useState<Empresa[]>([]);
   const [empresaSelecionada, setEmpresaSelecionada] = useState<string>('');
@@ -85,6 +133,8 @@ export default function EmitirDevolucao() {
   const [naturezaOperacao, setNaturezaOperacao] = useState<string>('DEVOLUCAO DE MERCADORIA');
   const [destinatario, setDestinatario] = useState<Destinatario>(destinatarioVazio);
   const [itens, setItens] = useState<ItemDevolucao[]>([{ ...itemVazio }]);
+  const [transporte, setTransporte] = useState<Transporte>({ ...transporteVazio });
+  const [classeCfop, setClasseCfop] = useState<ClasseCfop>('auto');
 
   // Emissão
   const [emitindo, setEmitindo] = useState<boolean>(false);
@@ -165,6 +215,28 @@ export default function EmitirDevolucao() {
   const addItem = () => setItens(prev => [...prev, { ...itemVazio }]);
   const removeItem = (idx: number) => setItens(prev => prev.filter((_, i) => i !== idx));
 
+  // Resolve o dígito da classe do CFOP conforme a seleção. 'auto' compara UFs.
+  const resolverPrimeiroDigito = (): string | null => {
+    if (classeCfop !== 'auto') return classeCfop;
+    const ufEmit = (empSelObj?.uf || '').trim().toUpperCase();
+    const ufDest = (destinatario.uf || '').trim().toUpperCase();
+    if (!ufEmit || !ufDest) return null;
+    return ufEmit === ufDest ? '1' : '2';
+  };
+
+  const aplicarClasseCfopAosItens = () => {
+    const primeiro = resolverPrimeiroDigito();
+    if (!primeiro) {
+      alert('Preencha a UF da empresa e do destinatário pra usar o modo Automático.');
+      return;
+    }
+    setItens(prev => prev.map(it => {
+      const cfop = (it.cfop || '').trim();
+      if (cfop.length !== 4 || !/^\d{4}$/.test(cfop)) return { ...it, cfop: `${primeiro}202` };
+      return { ...it, cfop: `${primeiro}${cfop.slice(1)}` };
+    }));
+  };
+
   const totalNota = itens.reduce((acc, it) => acc + (Number(it.quantidade) * Number(it.valor_unitario)), 0);
 
   const transmitir = async () => {
@@ -187,6 +259,7 @@ export default function EmitirDevolucao() {
         natureza_operacao: naturezaOperacao,
         destinatario,
         itens,
+        transporte,
       };
       const res = await api.post(`/empresas/${empresaSelecionada}/notas/devolucao`, body);
       setResultado(res.data);
@@ -233,6 +306,23 @@ export default function EmitirDevolucao() {
         <p className="text-sm text-muted mt-1">
           NF-e mod. 55, finalidade 4. Suba o XML da nota original ou preencha manualmente.
         </p>
+        {previewCarregado && (
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+            <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-i9-tint text-i9 font-bold">
+              finNFe = 4 · Devolução
+            </span>
+            {chaveReferenciada && (
+              <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-line-soft text-ink font-mono">
+                NFref: {chaveReferenciada}
+              </span>
+            )}
+            {naturezaOperacao && (
+              <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-line-soft text-muted">
+                {naturezaOperacao}
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Empresa */}
@@ -449,6 +539,44 @@ export default function EmitirDevolucao() {
                 <Plus size={14} /> Adicionar
               </button>
             </div>
+
+            {/* Operação fiscal — sobrescreve o 1º dígito do CFOP de todos os itens */}
+            <div className="mb-4 p-3 bg-line-soft rounded-lg">
+              <label className="text-xs font-bold text-muted block mb-1">Operação fiscal (classe do CFOP)</label>
+              <div className="flex flex-col md:flex-row gap-2 md:items-center">
+                <select
+                  value={classeCfop}
+                  onChange={e => setClasseCfop(e.target.value as ClasseCfop)}
+                  className="flex-1 px-3 py-2 border border-line rounded-lg bg-white text-sm"
+                >
+                  {CLASSES_CFOP.map(c => (
+                    <option key={c.valor} value={c.valor}>{c.label}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={aplicarClasseCfopAosItens}
+                  className="px-4 py-2 bg-i9 text-white rounded-lg font-bold text-sm hover:bg-i9-dark"
+                >
+                  Aplicar aos {itens.length} {itens.length === 1 ? 'item' : 'itens'}
+                </button>
+              </div>
+              <div className="text-xs text-muted mt-2">
+                {CLASSES_CFOP.find(c => c.valor === classeCfop)?.hint}
+                {classeCfop === 'auto' && empSelObj?.uf && destinatario.uf && (
+                  <>
+                    {' · '}
+                    <b>
+                      {empSelObj.uf.toUpperCase() === (destinatario.uf || '').toUpperCase()
+                        ? `${empSelObj.uf}→${destinatario.uf} = 1xxx (interna)`
+                        : `${empSelObj.uf}→${destinatario.uf} = 2xxx (interestadual)`}
+                    </b>
+                  </>
+                )}
+              </div>
+              <div className="text-xs text-muted mt-1">
+                Sobrescreve só o <b>primeiro dígito</b> do CFOP de cada item (sufixo 202/411/949… é preservado). Ainda dá pra editar item a item na tabela abaixo.
+              </div>
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="bg-line-soft">
@@ -487,9 +615,99 @@ export default function EmitirDevolucao() {
             </div>
           </section>
 
-          {/* Seção 5: Totais e transmissão */}
+          {/* Seção 5: Transporte */}
           <section className="bg-card border border-line rounded-xl p-5">
-            <h2 className="text-lg font-bold text-ink mb-4">5. Totais e transmissão</h2>
+            <h2 className="text-lg font-bold text-ink mb-4">5. Transporte</h2>
+            <p className="text-xs text-muted mb-4">
+              Opcional. Deixe modalidade em <b>9 — Sem frete</b> se a devolução não envolve transporte próprio ou contratado (grupo `transp` na SEFAZ).
+            </p>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="md:col-span-2">
+                <label className="text-xs font-bold text-muted block mb-1">Modalidade do frete (modFrete)</label>
+                <select
+                  value={transporte.mod_frete}
+                  onChange={e => setTransporte({ ...transporte, mod_frete: Number(e.target.value) })}
+                  className="w-full px-3 py-2 border border-line rounded-lg bg-white text-sm"
+                >
+                  {MOD_FRETE_OPCOES.map(o => (
+                    <option key={o.valor} value={o.valor}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {transporte.mod_frete !== 9 && (
+              <>
+                <div className="mt-4 pt-3 border-t border-line">
+                  <div className="text-xs font-bold text-ink mb-2">Transportador</div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <input placeholder="CNPJ (só dígitos)" value={transporte.transportador_cnpj || ''}
+                      onChange={e => setTransporte({ ...transporte, transportador_cnpj: e.target.value.replace(/\D/g, '').slice(0, 14) })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                    <input placeholder="CPF (só dígitos, se não tiver CNPJ)" value={transporte.transportador_cpf || ''}
+                      onChange={e => setTransporte({ ...transporte, transportador_cpf: e.target.value.replace(/\D/g, '').slice(0, 11) })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                    <input placeholder="Nome / Razão Social" value={transporte.transportador_nome || ''}
+                      onChange={e => setTransporte({ ...transporte, transportador_nome: e.target.value })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm md:col-span-2" />
+                    <input placeholder="Inscrição Estadual (ou ISENTO)" value={transporte.transportador_ie || ''}
+                      onChange={e => setTransporte({ ...transporte, transportador_ie: e.target.value.toUpperCase() })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                    <input placeholder="UF" value={transporte.transportador_uf || ''}
+                      onChange={e => setTransporte({ ...transporte, transportador_uf: e.target.value.toUpperCase().slice(0, 2) })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                    <input placeholder="Endereço" value={transporte.transportador_endereco || ''}
+                      onChange={e => setTransporte({ ...transporte, transportador_endereco: e.target.value })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm md:col-span-2" />
+                    <input placeholder="Município" value={transporte.transportador_municipio || ''}
+                      onChange={e => setTransporte({ ...transporte, transportador_municipio: e.target.value })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm md:col-span-2" />
+                  </div>
+                </div>
+
+                <div className="mt-4 pt-3 border-t border-line">
+                  <div className="text-xs font-bold text-ink mb-2">Veículo</div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <input placeholder="Placa (sem hífen)" value={transporte.veiculo_placa || ''}
+                      onChange={e => setTransporte({ ...transporte, veiculo_placa: e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 7) })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm font-mono" />
+                    <input placeholder="UF" value={transporte.veiculo_uf || ''}
+                      onChange={e => setTransporte({ ...transporte, veiculo_uf: e.target.value.toUpperCase().slice(0, 2) })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                    <input placeholder="RNTC (ANTT)" value={transporte.veiculo_rntc || ''}
+                      onChange={e => setTransporte({ ...transporte, veiculo_rntc: e.target.value })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                  </div>
+                </div>
+
+                <div className="mt-4 pt-3 border-t border-line">
+                  <div className="text-xs font-bold text-ink mb-2">Volume</div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    <input type="number" min="0" step="1" placeholder="Quantidade"
+                      value={transporte.volume_qtd ?? ''}
+                      onChange={e => setTransporte({ ...transporte, volume_qtd: e.target.value === '' ? null : Number(e.target.value) })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                    <input placeholder="Espécie (CX, PC…)" value={transporte.volume_especie || ''}
+                      onChange={e => setTransporte({ ...transporte, volume_especie: e.target.value.toUpperCase() })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                    <input type="number" min="0" step="0.001" placeholder="Peso líquido (kg)"
+                      value={transporte.volume_peso_liquido ?? ''}
+                      onChange={e => setTransporte({ ...transporte, volume_peso_liquido: e.target.value === '' ? null : Number(e.target.value) })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                    <input type="number" min="0" step="0.001" placeholder="Peso bruto (kg)"
+                      value={transporte.volume_peso_bruto ?? ''}
+                      onChange={e => setTransporte({ ...transporte, volume_peso_bruto: e.target.value === '' ? null : Number(e.target.value) })}
+                      className="px-3 py-2 border border-line rounded-lg text-sm" />
+                  </div>
+                </div>
+              </>
+            )}
+          </section>
+
+          {/* Seção 6: Totais e transmissão */}
+          <section className="bg-card border border-line rounded-xl p-5">
+            <h2 className="text-lg font-bold text-ink mb-4">6. Totais e transmissão</h2>
             <div className="flex items-center justify-between mb-4">
               <div>
                 <div className="text-sm text-muted">Valor total</div>

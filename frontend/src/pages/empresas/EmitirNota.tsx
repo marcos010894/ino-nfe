@@ -1,7 +1,24 @@
-import { useEffect, useState } from 'react';
-import { FileText, Play, CheckCircle2, XCircle, Loader2, Download, ExternalLink, AlertCircle, Coins, Plus, Trash2, Edit3 } from 'lucide-react';
-import api from '../../lib/api';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import {
+  AlertTriangle, CheckCircle2, Loader2, Lock, Mail, Printer,
+  Trash2, XCircle, Copy, ShieldAlert, Download,
+} from 'lucide-react';
+import api from '../../lib/api';
+
+/**
+ * Tela de emissão v3 — orientada ao usuário final da loja.
+ *
+ * A venda vem pronta do InnoSystem (via /integracao/receber-venda) e chega aqui
+ * como rascunho (?rascunho=<id>). O operador **não pode editar** — só confere,
+ * emite ou exclui e refaz na origem. Editar aqui criaria divergência entre o que
+ * o InnoSystem registrou e o que a SEFAZ autorizou.
+ *
+ * Fluxo dev (JSON colado / entrada manual) foi movido para /emitir/admin
+ * (EmitirNotaAdmin.tsx). Cadeado no rodapé abre gaveta técnica com senha.
+ */
+
+const SENHA_TECNICA = '010894';
 
 interface Empresa {
   id: number;
@@ -11,888 +28,1147 @@ interface Empresa {
   has_certificado?: boolean;
 }
 
-/**
- * Extrai a mensagem de rejeição da resposta_integradora da ACBr.
- * O motivo real vive em `autorizacao.motivo_status` (+ `codigo_status` como cStat).
- * Fallbacks: `error.message` (erros HTTP ACBr), `motivo_status` (raiz), `motivo`,
- * `mensagem`, `erro` string. Sem esses, devolve string vazia (deixa caller usar default).
- */
-function extrairMotivoRejeicao(r: any): string {
-  if (!r || typeof r !== 'object') return '';
-  const aut = r.autorizacao || {};
-  const cstat = aut.codigo_status || r.codigo_status;
-  const motivoAut = aut.motivo_status || r.motivo_status;
-  if (motivoAut) {
-    return cstat ? `cStat ${cstat}: ${motivoAut}` : String(motivoAut);
-  }
-  const err = r.error;
-  if (err && typeof err === 'object') {
-    const code = err.code ? `[${err.code}] ` : '';
-    if (err.message) return `${code}${err.message}`;
-  }
-  if (typeof r.erro === 'string') return r.erro;
-  if (r.motivo) return String(r.motivo);
-  if (r.mensagem) return String(r.mensagem);
-  return '';
+interface Rascunho {
+  id: number;
+  status: string;
+  modelo: string;
+  chave_acesso?: string | null;
+  numero?: number | null;
+  serie?: number | null;
+  valor_total: number;
+  json_venda: string;
+  payload_enviado?: string | null;
+  resposta_integradora?: string | null;
+  criado_em: string;
 }
 
-interface ItemManual {
-  codigo: string;
-  nome: string;
-  quantidade: number;
-  valor_unitario: number;
-  unidade: string;
+type Etapa =
+  | 'ocioso'          // rascunho carregado, aguardando emissão
+  | 'transmitindo'    // enviando pra SEFAZ
+  | 'autorizada'
+  | 'rejeitada'
+  | 'processando'     // NF-e assíncrona, polling
+  | 'invalidada';     // erro de validação backend (400)
+
+function fmtMoeda(v: number) {
+  return v.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function agrupar(chave: string) {
+  return chave.replace(/(.{4})/g, '$1 ').trim();
+}
+function motivoRejeicao(r: any): { motivo: string; cstat: string } {
+  if (!r || typeof r !== 'object') return { motivo: '', cstat: '' };
+  const aut = r.autorizacao || {};
+  const cstat = aut.codigo_status || r.codigo_status || (r.error && r.error.code) || '';
+  const motivo =
+    aut.motivo_status || r.motivo_status || (r.error && r.error.message) ||
+    r.motivo || r.mensagem || (typeof r.erro === 'string' ? r.erro : '') || '';
+  return { motivo: String(motivo), cstat: String(cstat) };
 }
 
 export default function EmitirNota() {
-  const [empresas, setEmpresas] = useState<Empresa[]>([]);
-  const [empresaSelecionada, setEmpresaSelecionada] = useState<string>('');
-  
-  const empSelecionadaObj = empresas.find(e => e.id.toString() === empresaSelecionada);
-  
-  // Abas de Modo: 'json' ou 'manual'
-  const [modoEntrada, setModoEntrada] = useState<'json' | 'manual'>('json');
-
-  // Modo JSON
-  const [jsonVenda, setJsonVenda] = useState<string>('');
-  const [jsonValido, setJsonValido] = useState<boolean>(false);
-  const [erroJson, setErroJson] = useState<string>('');
-
-  // Modo Manual Form
-  const [clienteNome, setClienteNome] = useState<string>('');
-  const [clienteCpf, setClienteCpf] = useState<string>('');
-  const [descontoManual, setDescontoManual] = useState<number>(0);
-  const [meioPagamento, setMeioPagamento] = useState<string>('17'); // Pix
-  const [itensManuais, setItensManuais] = useState<ItemManual[]>([
-    { codigo: 'JOIA01', nome: 'Anel Solitário', quantidade: 1, valor_unitario: 100.00, unidade: 'UN' }
-  ]);
-
-  // Novo Item Form
-  const [novoItem, setNovoItem] = useState<ItemManual>({
-    codigo: '',
-    nome: '',
-    quantidade: 1,
-    valor_unitario: 0,
-    unidade: 'UN'
-  });
-
-  const [previewVenda, setPreviewVenda] = useState<any>(null);
-  
-  // Estados de Emissão
-  const [emitindo, setEmitindo] = useState<boolean>(false);
-  const [resultado, setResultado] = useState<any>(null);
-  const [erroEmissao, setErroEmissao] = useState<string>('');
-  const [pollingActive, setPollingActive] = useState<boolean>(false);
-  
   const [searchParams] = useSearchParams();
   const rascunhoId = searchParams.get('rascunho');
 
-  // Carregar Rascunho se existir
+  const [empresas, setEmpresas] = useState<Empresa[]>([]);
+  const [empresaId, setEmpresaId] = useState<string>('');
+  const [rascunho, setRascunho] = useState<Rascunho | null>(null);
+  const [carregandoRascunho, setCarregandoRascunho] = useState<boolean>(!!rascunhoId);
+  const [etapa, setEtapa] = useState<Etapa>('ocioso');
+  const [notaEmitida, setNotaEmitida] = useState<Rascunho | null>(null);
+  const [erroMsg, setErroMsg] = useState<string>('');
+  const [pollingActive, setPollingActive] = useState<boolean>(false);
+
+  // Cadeado técnico
+  const [gavetaAberta, setGavetaAberta] = useState<boolean>(false);
+  const [modalSenhaAberto, setModalSenhaAberto] = useState<boolean>(false);
+  const [senhaInput, setSenhaInput] = useState<string>('');
+  const [erroSenha, setErroSenha] = useState<string>('');
+  const [abaGaveta, setAbaGaveta] = useState<'ent' | 'sai' | 'val' | 'log'>('ent');
+  const senhaRef = useRef<HTMLInputElement>(null);
+
+  // Toast simples
+  const [toast, setToast] = useState<string>('');
   useEffect(() => {
-    if (rascunhoId) {
-      api.get(`/integracao/rascunhos/${rascunhoId}`)
-        .then(res => {
-          if (res.data.json_venda) {
-            setJsonVenda(res.data.json_venda);
-            validarEPreview(res.data.json_venda);
-            setModoEntrada('json');
-          }
-        })
-        .catch(err => {
-          console.error("Erro ao carregar rascunho:", err);
-          alert("Erro ao carregar o rascunho.");
-        });
-    }
-  }, [rascunhoId]);
+    if (!toast) return;
+    const t = setTimeout(() => setToast(''), 2800);
+    return () => clearTimeout(t);
+  }, [toast]);
 
-  const jsonExemplo = {
-    cliente: {
-      nome: "Consumidor Exemplo",
-      cpf: "12345678909"
-    },
-    itens: [
-      {
-        codigo: "JOIA001",
-        nome: "Anel de Prata Solitário",
-        quantidade: 1,
-        valor_unitario: 150.00,
-        unidade: "UN"
-      },
-      {
-        codigo: "JOIA002",
-        nome: "Brinco Ouro 18k Argola",
-        quantidade: 2,
-        valor_unitario: 450.00,
-        unidade: "PR"
-      }
-    ],
-    desconto: 50.00,
-    pagamentos: [
-      {
-        meio_pagamento: "17", // Pix
-        valor: 1000.00
-      }
-    ]
-  };
-
-  // Carregar lista de empresas e inicializar JSON de exemplo
+  // --- Carregamento inicial: empresas + rascunho (se houver) ---
   useEffect(() => {
-    const exemploStr = JSON.stringify(jsonExemplo, null, 2);
-    setJsonVenda(exemploStr);
-    setJsonValido(true);
-    setPreviewVenda(jsonExemplo);
-
-    api.get('/empresas/')
-      .then(res => {
-        setEmpresas(res.data);
-        if (res.data.length > 0) {
-          setEmpresaSelecionada(res.data[0].id.toString());
-        }
-      })
-      .catch(err => {
-        console.error("Erro ao carregar empresas:", err);
-      });
+    api.get('/empresas/').then((res) => {
+      setEmpresas(res.data);
+      if (res.data.length > 0) setEmpresaId(String(res.data[0].id));
+    }).catch((e) => console.error('Erro empresas:', e));
   }, []);
 
-  // Sincronizar Preview no Modo Manual
   useEffect(() => {
-    if (modoEntrada === 'manual') {
-      const vendaObj = {
-        cliente: clienteNome || clienteCpf ? { nome: clienteNome, cpf: clienteCpf } : undefined,
-        itens: itensManuais,
-        desconto: descontoManual,
-        pagamentos: [
-          {
-            meio_pagamento: meioPagamento,
-            valor: Math.max(0, itensManuais.reduce((acc, it) => acc + (it.quantidade * it.valor_unitario), 0) - descontoManual)
-          }
-        ]
-      };
-      setPreviewVenda(vendaObj);
-      setJsonValido(itensManuais.length > 0);
-    }
-  }, [modoEntrada, clienteNome, clienteCpf, descontoManual, meioPagamento, itensManuais]);
+    if (!rascunhoId) return;
+    setCarregandoRascunho(true);
+    api.get(`/integracao/rascunhos/${rascunhoId}`)
+      .then((res) => setRascunho(res.data))
+      .catch(() => setErroMsg('Não foi possível carregar o rascunho — verifique se ele ainda existe.'))
+      .finally(() => setCarregandoRascunho(false));
+  }, [rascunhoId]);
 
-  const usarExemplo = () => {
-    const str = JSON.stringify(jsonExemplo, null, 2);
-    setJsonVenda(str);
-    validarEPreview(str);
-  };
+  // ESC fecha modal/gaveta
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (modalSenhaAberto) setModalSenhaAberto(false);
+      else if (gavetaAberta) setGavetaAberta(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [modalSenhaAberto, gavetaAberta]);
 
-  const handleJsonChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value;
-    setJsonVenda(val);
-    validarEPreview(val);
-  };
+  // Parse do json_venda pra render de conferência
+  const venda = useMemo(() => {
+    const fonte = notaEmitida || rascunho;
+    if (!fonte) return null;
+    try { return JSON.parse(fonte.json_venda); } catch { return null; }
+  }, [rascunho, notaEmitida]);
 
-  const validarEPreview = (val: string) => {
-    if (!val.trim()) {
-      setJsonValido(false);
-      setErroJson('');
-      setPreviewVenda(null);
-      return;
-    }
-
+  // --- Emissão ---
+  async function emitir(modelo: '55' | '65') {
+    if (!empresaId) { setErroMsg('Selecione uma empresa emissora.'); return; }
+    if (!rascunho) { setErroMsg('Nenhuma venda carregada para emitir.'); return; }
+    setErroMsg('');
+    setEtapa('transmitindo');
     try {
-      const parsed = JSON.parse(val);
-      if (!parsed.itens || !Array.isArray(parsed.itens) || parsed.itens.length === 0) {
-        setJsonValido(false);
-        setErroJson("O JSON precisa de um array 'itens' válido com ao menos um item.");
-        setPreviewVenda(null);
-        return;
-      }
-      setJsonValido(true);
-      setErroJson('');
-      setPreviewVenda(parsed);
+      const res = await api.post(`/empresas/${empresaId}/notas/`, {
+        json_venda: rascunho.json_venda,
+        modelo,
+        rascunho_id: parseInt(String(rascunho.id), 10),
+      });
+      const nota = res.data as Rascunho;
+      setNotaEmitida(nota);
+      if (nota.status === 'autorizada') setEtapa('autorizada');
+      else if (nota.status === 'processando') { setEtapa('processando'); iniciarPolling(nota.id); }
+      else setEtapa('rejeitada');
     } catch (e: any) {
-      setJsonValido(false);
-      setErroJson(`JSON Inválido: ${e.message}`);
-      setPreviewVenda(null);
+      // Erros 400 do backend (ValueError em montar_payload_nfce) chegam com detail
+      const detail = e?.response?.data?.detail || e?.message || 'Erro desconhecido';
+      setErroMsg(String(detail));
+      setEtapa('invalidada');
     }
-  };
+  }
 
-  const adicionarItemManual = () => {
-    if (!novoItem.nome || novoItem.valor_unitario <= 0) {
-      alert("Por favor, preencha o Nome e o Valor Unitário do produto.");
-      return;
-    }
-    const cod = novoItem.codigo || `PROD${itensManuais.length + 1}`;
-    setItensManuais([...itensManuais, { ...novoItem, codigo: cod }]);
-    setNovoItem({ codigo: '', nome: '', quantidade: 1, valor_unitario: 0, unidade: 'UN' });
-  };
-
-  const removerItemManual = (index: number) => {
-    setItensManuais(itensManuais.filter((_, idx) => idx !== index));
-  };
-
-  // Enviar para emissão
-  const emitirDocumento = async (modelo: string) => {
-    setErroEmissao('');
-    setResultado(null);
-
-    if (!empresaSelecionada) {
-      setErroEmissao("Selecione uma empresa emissora antes de prosseguir.");
-      return;
-    }
-
-    let jsonPayload = '';
-    if (modoEntrada === 'json') {
-      if (!jsonVenda.trim()) {
-        setErroEmissao("Cole the JSON de venda antes de emitir.");
-        return;
-      }
-      try {
-        const parsed = JSON.parse(jsonVenda);
-        if (!parsed.itens || !Array.isArray(parsed.itens) || parsed.itens.length === 0) {
-          setErroEmissao("O JSON da venda precisa conter ao menos um item em 'itens'.");
-          return;
-        }
-        jsonPayload = jsonVenda;
-      } catch (e: any) {
-        setErroEmissao(`JSON da Venda Inválido: ${e.message}`);
-        return;
-      }
-    } else {
-      if (itensManuais.length === 0) {
-        setErroEmissao("Adicione ao menos um item na lista de itens.");
-        return;
-      }
-      const totalNota = Math.max(0, itensManuais.reduce((acc, it) => acc + (it.quantidade * it.valor_unitario), 0) - descontoManual);
-      jsonPayload = JSON.stringify({
-        cliente: clienteNome || clienteCpf ? { nome: clienteNome, cpf: clienteCpf } : undefined,
-        itens: itensManuais,
-        desconto: descontoManual,
-        pagamentos: [{ meio_pagamento: meioPagamento, valor: totalNota }]
-      });
-    }
-
-    setEmitindo(true);
-
-    try {
-      const res = await api.post(`/empresas/${empresaSelecionada}/notas/`, {
-        json_venda: jsonPayload,
-        modelo: modelo,
-        rascunho_id: rascunhoId ? parseInt(rascunhoId) : undefined
-      });
-      
-      const nota = res.data;
-      let parsedResposta: any = {};
-      if (nota.resposta_integradora) {
-        try {
-          parsedResposta = JSON.parse(nota.resposta_integradora);
-        } catch (e) {
-          parsedResposta = { motivo: String(nota.resposta_integradora) };
-        }
-      }
-
-      
-      if (nota.status === 'autorizada') {
-        setResultado({
-          sucesso: true,
-          id: nota.id,
-          chave: nota.chave_acesso,
-          numero: nota.numero,
-          serie: nota.serie,
-          status: 'autorizada',
-          pdf: nota.pdf_url,
-          xml: nota.xml_url
-        });
-      } else if (nota.status === 'processando') {
-        setResultado({
-          sucesso: true,
-          id: nota.id,
-          chave: nota.chave_acesso,
-          numero: nota.numero,
-          serie: nota.serie,
-          status: 'processando',
-          pdf: nota.pdf_url,
-          xml: nota.xml_url
-        });
-        iniciarPollingNfe(nota.id);
-      } else {
-        const msgErro = extrairMotivoRejeicao(parsedResposta) || "Rejeitada pela SEFAZ (Verifique regras de ICMS/CSC)";
-
-        setResultado({
-          sucesso: false,
-          mensagem: msgErro
-        });
-      }
-    } catch (err: any) {
-      console.error("Erro na emissao de nota:", err);
-      let detailMsg = err.message || "Erro desconhecido ao transmitir a nota.";
-      if (err.response?.data?.detail) {
-        const d = err.response.data.detail;
-        if (typeof d === 'string') detailMsg = d;
-        else if (Array.isArray(d)) detailMsg = d.map((e: any) => `${e.loc?.join('.') || 'Campo'}: ${e.msg}`).join(' | ');
-        else detailMsg = JSON.stringify(d);
-      } else if (err.response?.status === 401) {
-        detailMsg = "Sua sessão expirou ou credenciais inválidas. Faça login novamente em /login.";
-      }
-      setErroEmissao(detailMsg);
-    } finally {
-      setEmitindo(false);
-    }
-  };
-
-
-
-  const iniciarPollingNfe = (notaId: number) => {
+  async function iniciarPolling(notaId: number) {
     setPollingActive(true);
-    const interval = setInterval(async () => {
+    const tentar = async (i: number): Promise<void> => {
+      if (i > 20) { setPollingActive(false); return; }
+      await new Promise((r) => setTimeout(r, 3000));
       try {
-        const res = await api.post(`/empresas/${empresaSelecionada}/notas/${notaId}/consultar-status`);
-        const nota = res.data;
-        if (nota.status !== 'processando') {
-          clearInterval(interval);
-          setPollingActive(false);
-          if (nota.status === 'autorizada') {
-            setResultado({
-              sucesso: true,
-              id: nota.id,
-              chave: nota.chave_acesso,
-              numero: nota.numero,
-              serie: nota.serie,
-              status: 'autorizada',
-              pdf: nota.pdf_url,
-              xml: nota.xml_url
-            });
-          } else {
-            let parsed: any = {};
-            if (nota.resposta_integradora) {
-              try {
-                parsed = JSON.parse(nota.resposta_integradora);
-              } catch (e) {
-                parsed = { motivo: String(nota.resposta_integradora) };
-              }
-            }
-            const msg = extrairMotivoRejeicao(parsed) || "Rejeitada pela SEFAZ";
-            setResultado({
-              sucesso: false,
-              mensagem: msg
-            });
-          }
+        const r = await api.get(`/integracao/notas/${notaId}`);
+        const nota = r.data as Rascunho;
+        setNotaEmitida(nota);
+        if (nota.status === 'autorizada') { setEtapa('autorizada'); setPollingActive(false); return; }
+        if (nota.status === 'rejeitada' || nota.status === 'cancelada') { setEtapa('rejeitada'); setPollingActive(false); return; }
+      } catch { /* ignora, tenta de novo */ }
+      return tentar(i + 1);
+    };
+    tentar(0);
+  }
 
-        }
-      } catch (err) {
-        console.error("Erro no polling de status:", err);
-      }
-    }, 5000);
-  };
-
-
-
-  const baixarXML = async () => {
-    if (!resultado || !resultado.id) return;
+  async function excluirRascunho() {
+    if (!rascunho) return;
+    if (!confirm(`Excluir a venda ${rascunho.id}? Ela volta a ficar editável no InnoSystem.`)) return;
     try {
-      const res = await api.get(`/empresas/${empresaSelecionada}/notas/${resultado.id}/xml`, {
-        responseType: 'blob'
-      });
-      const url = window.URL.createObjectURL(new Blob([res.data]));
-      const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', `${resultado.chave}.xml`);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-    } catch (err) {
-      console.error(err);
-      alert("Erro ao baixar o XML.");
+      await api.delete(`/integracao/rascunhos/${rascunho.id}`);
+      setToast('Venda devolvida ao InnoSystem.');
+      setRascunho(null);
+    } catch {
+      setToast('Falha ao excluir — verifique se você tem permissão.');
     }
-  };
+  }
 
-  const baixarPDF = async () => {
-    if (!resultado || !resultado.id) return;
-    try {
-      const res = await api.get(`/empresas/${empresaSelecionada}/notas/${resultado.id}/pdf`, {
-        responseType: 'blob'
-      });
-      const url = window.URL.createObjectURL(new Blob([res.data], { type: 'application/pdf' }));
-      window.open(url, '_blank');
-    } catch (err) {
-      console.error(err);
-      alert("Erro ao abrir o PDF.");
+  function abrirCadeado() {
+    setSenhaInput(''); setErroSenha('');
+    setModalSenhaAberto(true);
+    setTimeout(() => senhaRef.current?.focus(), 50);
+  }
+  function validarSenha() {
+    if (senhaInput === SENHA_TECNICA) {
+      setModalSenhaAberto(false);
+      setGavetaAberta(true);
+      setAbaGaveta('ent');
+    } else {
+      setErroSenha('Senha incorreta. Tente novamente.');
+      setSenhaInput('');
+      senhaRef.current?.focus();
     }
-  };
+  }
 
-  const calcularSubtotal = () => {
-    if (modoEntrada === 'json') {
-      if (!previewVenda) return 0;
-      return previewVenda.itens.reduce((acc: number, item: any) => acc + (item.quantidade * item.valor_unitario), 0);
-    }
-    return itensManuais.reduce((acc, it) => acc + (it.quantidade * it.valor_unitario), 0);
-  };
-
-  const calcularTotal = () => {
-    if (modoEntrada === 'json') {
-      if (!previewVenda) return 0;
-      const sub = calcularSubtotal();
-      const desc = parseFloat(previewVenda.desconto) || 0;
-      return Math.max(0, sub - desc);
-    }
-    return Math.max(0, calcularSubtotal() - descontoManual);
-  };
+  // --- Render helpers ---
+  const empresaAtual = empresas.find((e) => String(e.id) === empresaId);
+  const fonteJson = notaEmitida || rascunho;
+  const respostaObj = fonteJson?.resposta_integradora
+    ? (() => { try { return JSON.parse(fonteJson.resposta_integradora!); } catch { return null; } })()
+    : null;
+  const rej = motivoRejeicao(respostaObj);
 
   return (
-    <div className="flex flex-col gap-6 max-w-6xl mx-auto pb-12">
-      <div>
-        <h1 className="text-3xl font-extrabold tracking-tight bg-gradient-to-r from-ink to-ink-soft bg-clip-text text-transparent">
-          Emitir Nota Fiscal (NFC-e)
-        </h1>
-        <p className="text-muted text-sm font-medium mt-1">
-          Escolha entre colar o JSON de venda do InnoSystem ou digitar todas as informações manualmente.
-        </p>
-      </div>
-
-      {/* Abas de Entrada */}
-      <div className="flex gap-2 border-b border-line pb-px">
-        <button
-          onClick={() => { setModoEntrada('json'); setPreviewVenda(null); setJsonValido(false); }}
-          className={`px-4 py-2.5 text-sm font-bold border-b-2 transition-all flex items-center gap-2 ${
-            modoEntrada === 'json' ? 'border-i9 text-i9' : 'border-transparent text-muted hover:text-ink'
-          }`}
-        >
-          <FileText size={16} />
-          Colar JSON de Venda
-        </button>
-        <button
-          onClick={() => { setModoEntrada('manual'); }}
-          className={`px-4 py-2.5 text-sm font-bold border-b-2 transition-all flex items-center gap-2 ${
-            modoEntrada === 'manual' ? 'border-i9 text-i9' : 'border-transparent text-muted hover:text-ink'
-          }`}
-        >
-          <Edit3 size={16} />
-          Digitação Manual (Formulário)
-        </button>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-        
-        {/* Lado Esquerdo: Inputs / Form */}
-        <div className="flex flex-col gap-6">
-          
-          {/* Seletor de Empresa */}
-          <div className="bg-card border border-line rounded-DEFAULT shadow p-5 flex flex-col gap-3">
-            <label className="text-xs font-bold text-muted uppercase tracking-wider">Empresa Emissora</label>
-            <select
-              value={empresaSelecionada}
-              onChange={(e) => setEmpresaSelecionada(e.target.value)}
-              className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none font-semibold text-ink"
-            >
-              {empresas.length === 0 ? (
-                <option value="">Nenhuma empresa cadastrada...</option>
-              ) : (
-                empresas.map(emp => (
-                  <option key={emp.id} value={emp.id}>
-                    {emp.nome_fantasia || emp.razao_social} - {emp.cnpj} {!emp.has_certificado ? ' (Sem Certificado A1)' : ''}
-                  </option>
-                ))
-              )}
-            </select>
-
-            {empSelecionadaObj && !empSelecionadaObj.has_certificado && (
-              <div className="bg-red-500/10 border border-red-500/30 text-red-400 p-3 rounded-lg text-xs font-semibold flex items-center justify-between">
-                <span className="flex items-center gap-1.5">
-                  <AlertCircle size={15} /> Empresa sem Certificado Digital A1 ativo.
-                </span>
-                <a href={`/empresas/${empSelecionadaObj.id}`} className="underline font-bold hover:text-white">
-                  Cadastrar Certificado →
-                </a>
-              </div>
-            )}
-          </div>
-
-
-          {modoEntrada === 'json' ? (
-            /* Modo JSON Area */
-            <div className="bg-card border border-line rounded-DEFAULT shadow p-6 flex flex-col gap-4 relative">
-              <div className="flex justify-between items-center">
-                <label className="text-xs font-bold text-muted uppercase tracking-wider flex items-center gap-2">
-                  <FileText size={16} /> JSON da Venda
-                </label>
-                <button 
-                  onClick={usarExemplo}
-                  className="text-xs text-i9 font-bold hover:underline flex items-center gap-1"
-                >
-                  Usar Exemplo de Venda
-                </button>
-              </div>
-
-              <div className="relative">
-                <textarea
-                  value={jsonVenda}
-                  onChange={handleJsonChange}
-                  placeholder='Cole o JSON da venda aqui...'
-                  rows={12}
-                  className="w-full bg-field border border-line rounded-lg p-3 text-sm font-mono focus:border-i9 outline-none resize-none leading-relaxed text-ink-soft placeholder:text-muted/60"
-                />
-                <div className="absolute bottom-3 right-3 flex items-center gap-1.5 bg-card border border-line px-2 py-1 rounded-md text-xs font-bold shadow-sm">
-                  {jsonValido ? (
-                    <span className="text-i9 flex items-center gap-1">
-                      <CheckCircle2 size={14} /> JSON Pronto
-                    </span>
-                  ) : jsonVenda ? (
-                    <span className="text-warn flex items-center gap-1">
-                      <XCircle size={14} /> Erro de Sintaxe
-                    </span>
-                  ) : (
-                    <span className="text-muted">Aguardando dados</span>
-                  )}
-                </div>
-              </div>
-
-              {erroJson && (
-                <div className="text-xs text-warn font-semibold bg-warn-tint border border-[#f0c9c4] p-3 rounded-lg flex items-start gap-2">
-                  <AlertCircle size={14} className="mt-0.5 flex-shrink-0" />
-                  <span>{erroJson}</span>
-                </div>
-              )}
-            </div>
-          ) : (
-            /* Modo Digitação Manual */
-            <div className="flex flex-col gap-6">
-              
-              {/* Cliente Form */}
-              <div className="bg-card border border-line rounded-DEFAULT shadow p-5 flex flex-col gap-4">
-                <h3 className="text-xs font-extrabold text-i9 uppercase tracking-wider border-b border-line pb-2">Identificação do Consumidor (Opcional)</h3>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] font-bold text-muted uppercase">Nome do Cliente</label>
-                    <input
-                      type="text"
-                      value={clienteNome}
-                      onChange={(e) => setClienteNome(e.target.value)}
-                      placeholder="Ex: João da Silva"
-                      className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
-                    />
-                  </div>
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] font-bold text-muted uppercase">CPF ou CNPJ</label>
-                    <input
-                      type="text"
-                      value={clienteCpf}
-                      onChange={(e) => setClienteCpf(e.target.value)}
-                      placeholder="Ex: 000.000.000-00"
-                      className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Adicionar Itens Form */}
-              <div className="bg-card border border-line rounded-DEFAULT shadow p-5 flex flex-col gap-4">
-                <h3 className="text-xs font-extrabold text-i9 uppercase tracking-wider border-b border-line pb-2">Itens da Nota</h3>
-                
-                {/* Lista de Itens Adicionados */}
-                <div className="divide-y divide-line-soft border border-line rounded-lg max-h-48 overflow-y-auto bg-field">
-                  {itensManuais.length === 0 ? (
-                    <div className="p-4 text-center text-xs text-muted">Nenhum produto adicionado à nota ainda.</div>
-                  ) : (
-                    itensManuais.map((it, idx) => (
-                      <div key={idx} className="p-3 flex justify-between items-center text-xs">
-                        <div className="flex flex-col">
-                          <span className="font-bold text-ink">{it.nome}</span>
-                          <span className="text-[10px] text-muted">Código: {it.codigo} | {it.quantidade} {it.unidade} × R$ {it.valor_unitario.toFixed(2)}</span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => removerItemManual(idx)}
-                          className="text-warn hover:bg-warn-tint p-1.5 rounded-lg transition-colors"
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    ))
-                  )}
-                </div>
-
-                {/* Linha do Form do Novo Item */}
-                <div className="grid grid-cols-1 sm:grid-cols-5 gap-3 border-t border-line-soft pt-4 items-end">
-                  <div className="flex flex-col gap-1 sm:col-span-2">
-                    <label className="text-[10px] font-bold text-muted uppercase">Nome do Item *</label>
-                    <input
-                      type="text"
-                      value={novoItem.nome}
-                      onChange={(e) => setNovoItem({ ...novoItem, nome: e.target.value })}
-                      placeholder="Anel, brinco..."
-                      className="bg-field border border-line rounded-lg px-2.5 py-1.5 text-xs focus:border-i9 outline-none"
-                    />
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <label className="text-[10px] font-bold text-muted uppercase">Qtd *</label>
-                    <input
-                      type="number"
-                      min={1}
-                      value={novoItem.quantidade}
-                      onChange={(e) => setNovoItem({ ...novoItem, quantidade: parseInt(e.target.value) || 1 })}
-                      className="bg-field border border-line rounded-lg px-2.5 py-1.5 text-xs focus:border-i9 outline-none font-mono"
-                    />
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <label className="text-[10px] font-bold text-muted uppercase">Preço Un. *</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={novoItem.valor_unitario || ''}
-                      onChange={(e) => setNovoItem({ ...novoItem, valor_unitario: parseFloat(e.target.value) || 0 })}
-                      placeholder="0,00"
-                      className="bg-field border border-line rounded-lg px-2.5 py-1.5 text-xs focus:border-i9 outline-none font-mono"
-                    />
-                  </div>
-                  <button
-                    type="button"
-                    onClick={adicionarItemManual}
-                    className="bg-bg border border-line hover:bg-line-soft text-ink font-bold text-xs py-2 px-3 rounded-lg flex items-center justify-center gap-1 transition-colors h-max"
-                  >
-                    <Plus size={14} /> Adicionar
-                  </button>
-                </div>
-              </div>
-
-              {/* Informações Gerais de Venda Form */}
-              <div className="bg-card border border-line rounded-DEFAULT shadow p-5 flex flex-col gap-4">
-                <h3 className="text-xs font-extrabold text-i9 uppercase tracking-wider border-b border-line pb-2">Pagamento & Totais</h3>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  <div className="flex flex-col gap-1.5">
-                    <label className="text-[10px] font-bold text-muted uppercase">Meio de Pagamento</label>
-                    <select
-                      value={meioPagamento}
-                      onChange={(e) => setMeioPagamento(e.target.value)}
-                      className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
-                    >
-                      <option value="17">Pix</option>
-                      <option value="01">Dinheiro</option>
-                      <option value="03">Cartão de Crédito</option>
-                      <option value="04">Cartão de Débito</option>
-                      <option value="99">Outros</option>
-                    </select>
-                  </div>
-                  <div className="flex flex-col gap-1.5 sm:col-span-2">
-                    <label className="text-[10px] font-bold text-muted uppercase">Desconto Global (R$)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={descontoManual || ''}
-                      onChange={(e) => setDescontoManual(parseFloat(e.target.value) || 0)}
-                      placeholder="0,00"
-                      className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none font-mono"
-                    />
-                  </div>
-                </div>
-              </div>
-
-            </div>
+    <div className="min-h-screen bg-bg text-ink">
+      {/* ===================== Cabeçalho ===================== */}
+      <header className="sticky top-0 z-40 bg-ink text-white px-6 py-3 flex flex-wrap gap-4 items-center shadow-lg">
+        <div className="font-extrabold text-sm tracking-tight">
+          InnoFiscal <span className="text-[#7FA9F5]">/ emissão</span>
+        </div>
+        <div className="ml-auto flex items-center gap-3 text-xs">
+          {empresaAtual && (
+            <span className="opacity-80">
+              {empresaAtual.nome_fantasia || empresaAtual.razao_social} · CNPJ {empresaAtual.cnpj}
+            </span>
           )}
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider bg-ok/20 text-ok">
+            <span className="w-1.5 h-1.5 rounded-full bg-ok" /> Produção
+          </span>
+        </div>
+      </header>
+
+      <main className="max-w-[1300px] mx-auto px-6 pt-6 pb-32">
+        {/* Título */}
+        <div className="mb-5">
+          <div className="inline-block text-[10px] font-bold uppercase tracking-widest text-i9 bg-i9-tint px-2 py-1 rounded mb-2">
+            Conferir e emitir
+          </div>
+          <h2 className="text-2xl font-extrabold tracking-tight">Emissão de Nota Fiscal</h2>
+          <p className="text-sm text-ink-soft max-w-[76ch] mt-1">
+            A venda chega pronta do InnoSystem e não pode ser alterada aqui. Confere, emite — ou
+            exclui e refaz na origem.
+          </p>
         </div>
 
-        {/* Lado Direito: Preview & Emissão */}
-        <div className="flex flex-col gap-6">
-          
-          {/* Prévia da Venda */}
-          <div className="bg-card border border-line rounded-DEFAULT shadow overflow-hidden flex flex-col min-h-[300px]">
-            <div className="bg-bg px-6 py-4 border-b border-line flex justify-between items-center">
-              <span className="text-xs font-bold text-muted uppercase tracking-wider">Prévia do Cupom</span>
-              <span className="text-xs font-bold text-ink-soft">Consumidor</span>
+        {/* Seletor de empresa (só relevante em multiempresa) */}
+        {empresas.length > 1 && (
+          <div className="mb-4 bg-card border border-line rounded-DEFAULT shadow p-3 flex items-center gap-3">
+            <label className="text-[10px] font-bold uppercase tracking-wider text-muted">Emissor</label>
+            <select
+              className="bg-field border border-line rounded-lg px-3 py-2 text-sm flex-1"
+              value={empresaId}
+              onChange={(e) => setEmpresaId(e.target.value)}
+            >
+              {empresas.map((e) => (
+                <option key={e.id} value={e.id}>
+                  {e.nome_fantasia || e.razao_social} · {e.cnpj}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {/* Faixa-trava: aviso "não editável" */}
+        {rascunho && !notaEmitida && (
+          <div className="mb-5 flex gap-3 items-start bg-gradient-to-r from-[#FFF9EC] to-[#FDF4E2] border-l-4 border-gold rounded-r-DEFAULT px-4 py-3">
+            <Lock size={18} className="text-gold flex-shrink-0 mt-0.5" />
+            <div className="text-[13px] text-[#7A4E06]">
+              <b className="font-extrabold block mb-0.5">Esta venda não pode ser editada aqui</b>
+              Produtos, valores e formas de pagamento vieram do InnoSystem. Divergência? {' '}
+              <button onClick={excluirRascunho} className="underline font-semibold hover:text-warn">
+                exclua esta venda
+              </button>{' '} — ela volta a ficar editável na origem.
             </div>
+          </div>
+        )}
 
-            {!previewVenda ? (
-              <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
-                <Coins size={40} className="text-muted opacity-40 mb-3" />
-                <h4 className="text-sm font-bold text-ink-soft">Aguardando dados de venda</h4>
-                <p className="text-xs text-muted mt-1 max-w-[280px]">Insira o JSON de venda ou insira itens manualmente para gerar a prévia.</p>
-              </div>
-            ) : (
-              <div className="p-6 flex flex-col gap-6">
-                
-                {/* Cliente */}
-                {previewVenda.cliente && (
-                  <div className="bg-line-soft rounded-lg p-3 border border-line text-xs flex flex-col gap-1">
-                    <span className="font-bold text-ink-soft">DESTINATÁRIO / CLIENTE</span>
-                    <div className="flex justify-between text-ink mt-1">
-                      <span className="font-semibold">{previewVenda.cliente.nome || 'Consumidor não identificado'}</span>
-                      {previewVenda.cliente.cpf && <span className="font-mono">{previewVenda.cliente.cpf}</span>}
+        {/* --- Estado: sem rascunho carregado --- */}
+        {!rascunho && !carregandoRascunho && !notaEmitida && (
+          <div className="bg-card border border-line rounded-DEFAULT shadow p-8 text-center">
+            <div className="mx-auto w-14 h-14 rounded-full bg-i9-tint grid place-items-center mb-3">
+              <AlertTriangle className="text-i9" size={26} />
+            </div>
+            <h3 className="text-lg font-extrabold mb-1">Nenhuma venda carregada</h3>
+            <p className="text-sm text-ink-soft max-w-md mx-auto">
+              As vendas chegam do InnoSystem pela API de integração. Abra um rascunho pela lista
+              de <a href="/documentos/rascunhos" className="text-i9 underline">notas recebidas</a>{' '}
+              — ou, se você for da equipe técnica, use a <a href="/emitir/admin" className="text-i9 underline">tela dev</a>.
+            </p>
+          </div>
+        )}
+
+        {/* Loading rascunho */}
+        {carregandoRascunho && (
+          <div className="bg-card border border-line rounded-DEFAULT shadow p-6 flex items-center gap-3 text-sm text-ink-soft">
+            <Loader2 className="animate-spin" size={18} /> Carregando venda…
+          </div>
+        )}
+
+        {/* --- Painel principal: conferir + emitir --- */}
+        {rascunho && venda && (
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-6 items-start">
+            <div>
+              <div className="bg-card border border-line rounded-DEFAULT shadow p-6">
+                {/* Topo */}
+                <div className="flex justify-between items-start gap-4 mb-5">
+                  <div>
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-muted mb-1">
+                      Venda #{rascunho.id} · recebida em {new Date(rascunho.criado_em).toLocaleString('pt-BR')}
                     </div>
+                    <h3 className="text-xl font-extrabold tracking-tight">Conferir e emitir</h3>
                   </div>
-                )}
+                </div>
 
-                {/* Itens */}
-                <div className="flex flex-col gap-2">
-                  <span className="text-[10px] font-bold text-muted uppercase tracking-wider">Itens do Cupom</span>
-                  <div className="border border-line rounded-lg overflow-hidden divide-y divide-line-soft">
-                    {previewVenda.itens.map((item: any, idx: number) => (
-                      <div key={idx} className="p-3 flex justify-between items-center text-xs hover:bg-i9-tint/20">
-                        <div className="flex flex-col">
-                          <span className="text-ink">{item.descricao || item.nome}</span>
-                          <span className="text-muted text-[10px] font-medium">Qtd: {item.quantidade} {item.unidade || 'UN'} × R$ {Number(item.valor_unitario || 0).toFixed(2)}</span>
+                {/* Destinatário */}
+                <ClienteCard cliente={venda.cliente} />
+
+                {/* Lista de itens */}
+                <div className="border-t border-line">
+                  {(venda.itens || []).map((it: any, i: number) => (
+                    <div key={i} className="grid grid-cols-[auto_1fr_auto] gap-4 py-3 border-b border-line items-baseline">
+                      <span className="text-xs text-muted font-mono">{i + 1}</span>
+                      <div>
+                        <div className="font-semibold text-sm leading-snug">
+                          {(it.nome || it.descricao || 'Item sem nome').toString()}
                         </div>
-                        <span className="font-mono text-ink">R$ {(Number(item.quantidade || 0) * Number(item.valor_unitario || 0)).toFixed(2)}</span>
+                        <div className="text-xs text-muted mt-0.5">
+                          {it.codigo && <>Código {it.codigo} · </>}
+                          {it.quantidade} {it.unidade || 'UN'} × R$ {fmtMoeda(Number(it.valor_unitario || 0))}
+                        </div>
                       </div>
-                    ))}
-                  </div>
+                      <span className="font-mono text-sm">
+                        {fmtMoeda(Number(it.quantidade || 0) * Number(it.valor_unitario || 0))}
+                      </span>
+                    </div>
+                  ))}
                 </div>
 
                 {/* Totais */}
-                <div className="flex flex-col gap-2 border-t border-line-soft pt-4">
-                  <div className="flex justify-between text-xs text-muted font-medium">
-                    <span>Subtotal dos itens</span>
-                    <span className="font-mono">R$ {calcularSubtotal().toFixed(2)}</span>
-                  </div>
-                  {Number(previewVenda.desconto || 0) > 0 && (
-                    <div className="flex justify-between text-xs text-warn font-semibold">
-                      <span>Desconto</span>
-                      <span className="font-mono">- R$ {Number(previewVenda.desconto).toFixed(2)}</span>
-                    </div>
-                  )}
-                  <div className="flex justify-between items-center text-sm font-bold text-ink border-t border-line-soft pt-3 mt-1">
-                    <span>Valor Líquido</span>
-                    <span className="text-lg text-i9 font-mono">R$ {calcularTotal().toFixed(2)}</span>
+                <div className="py-4 space-y-1.5">
+                  <LinhaTotal rotulo="Soma dos produtos" valor={rascunho.valor_total + Number(venda.desconto || 0)} />
+                  <LinhaTotal rotulo="Desconto" valor={Number(venda.desconto || 0)} />
+                  {(venda.pagamentos || []).map((p: any, i: number) => (
+                    <LinhaTotal key={i} rotulo={`Pagamento · ${labelPagamento(p.meio_pagamento)}`} valor={Number(p.valor || 0)} />
+                  ))}
+                  <div className="flex justify-between items-baseline pt-3 border-t-2 border-ink mt-2">
+                    <span className="font-extrabold text-base">Total da nota</span>
+                    <b className="text-3xl font-extrabold tracking-tight">R$ {fmtMoeda(rascunho.valor_total)}</b>
                   </div>
                 </div>
 
-                {/* Pagamentos */}
-                {previewVenda.pagamentos && previewVenda.pagamentos.length > 0 && (
-                  <div className="flex flex-col gap-2 bg-line-soft/50 border border-line-soft p-3 rounded-lg">
-                    <span className="text-[10px] font-bold text-muted uppercase tracking-wider">Meios de Pagamento</span>
-                    {previewVenda.pagamentos.map((pag: any, idx: number) => (
-                      <div key={idx} className="flex justify-between text-xs font-semibold text-ink-soft">
-                        <span>
-                          {pag.meio_pagamento === "17" ? "PIX" : pag.meio_pagamento === "01" ? "Dinheiro" : pag.meio_pagamento === "03" ? "Cartão Crédito" : pag.meio_pagamento === "04" ? "Cartão Débito" : "Outros"}
-                        </span>
-                        <span className="font-mono text-ink">R$ {Number(pag.valor || 0).toFixed(2)}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                
-                {/* Botões de Transmissão */}
-                <div className="flex flex-col gap-2">
-                  {!empSelecionadaObj?.has_certificado && (
-                    <div className="bg-warn-tint border border-[#f0c9c4] text-warn p-3 rounded-xl text-xs font-semibold flex items-center gap-2 mb-2">
-                      <AlertCircle size={16} />
-                      Você precisa configurar o Certificado Digital da empresa antes de emitir notas.
-                    </div>
-                  )}
+                {/* Botões */}
+                <div className="grid grid-cols-1 sm:grid-cols-[1.35fr_1fr] gap-3 mt-5">
+                  <BotaoEmitir
+                    disabled={etapa === 'transmitindo' || etapa === 'processando' || !!notaEmitida}
+                    onClick={() => emitir('65')}
+                    primaria
+                    titulo="Emitir NFC-e"
+                    sub="Cupom para o consumidor · modelo 65"
+                  />
+                  <BotaoEmitir
+                    disabled={etapa === 'transmitindo' || etapa === 'processando' || !!notaEmitida}
+                    onClick={() => emitir('55')}
+                    primaria={false}
+                    titulo="Emitir NF-e"
+                    sub="Nota modelo 55"
+                  />
+                </div>
+
+                {/* Rodapé painel */}
+                <div className="flex justify-between items-center gap-3 mt-5 pt-4 border-t border-line flex-wrap">
                   <button
-                    onClick={() => emitirDocumento('65')}
-                    disabled={emitindo || pollingActive || !jsonValido || !empSelecionadaObj?.has_certificado}
-                    className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-b from-i9 to-i9-dark text-white font-extrabold text-sm shadow hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={excluirRascunho}
+                    disabled={!!notaEmitida}
+                    className="inline-flex items-center gap-2 text-sm font-semibold text-warn px-3 py-2 rounded-lg border border-warn/30 hover:bg-warn-tint disabled:opacity-40"
                   >
-                    {emitindo && !pollingActive ? (
-                      <>
-                        <Loader2 size={16} className="animate-spin" />
-                        Transmitindo NFC-e...
-                      </>
-                    ) : (
-                      <>
-                        <Play size={16} fill="white" />
-                        Transmitir NFC-e (modelo 65)
-                      </>
-                    )}
-                  </button>
-                  <button
-                    onClick={() => emitirDocumento('55')}
-                    disabled={emitindo || pollingActive || !jsonValido || !empSelecionadaObj?.has_certificado}
-                    className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-white border border-i9 text-i9 font-extrabold text-sm shadow hover:bg-i9-tint/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {pollingActive ? (
-                      <>
-                        <Loader2 size={16} className="animate-spin" />
-                        Consultando Status NF-e (Polling)...
-                      </>
-                    ) : (
-                      <>
-                        <Play size={16} className="text-i9" />
-                        Transmitir NF-e (modelo 55)
-                      </>
-                    )}
+                    <Trash2 size={14} /> Excluir venda e refazer no InnoSystem
                   </button>
                 </div>
               </div>
-            )}
+
+              {/* Resultado embaixo */}
+              <div className="mt-5">
+                {etapa === 'transmitindo' && <ResultadoTransmitindo />}
+                {etapa === 'processando' && <ResultadoProcessando active={pollingActive} />}
+                {etapa === 'autorizada' && notaEmitida && (
+                  <ResultadoAutorizada nota={notaEmitida} />
+                )}
+                {etapa === 'rejeitada' && (
+                  <ResultadoRejeitada motivo={rej.motivo} cstat={rej.cstat} onExcluir={excluirRascunho} />
+                )}
+                {etapa === 'invalidada' && (
+                  <ResultadoInvalidada erro={erroMsg} onExcluir={excluirRascunho} />
+                )}
+              </div>
+            </div>
+
+            {/* Preview HTML real do documento — toggle 65/55 */}
+            <aside className="hidden lg:block">
+              <PreviewArea
+                autorizada={etapa === 'autorizada'}
+                nota={notaEmitida}
+                empresa={empresaAtual}
+                venda={venda}
+                valorTotal={rascunho.valor_total}
+              />
+            </aside>
           </div>
-          
-          {/* Resultados da Emissão */}
-          {erroEmissao && (
-            <div className="bg-warn-tint border border-[#f0c9c4] text-warn p-4 rounded-xl text-sm font-semibold flex items-start gap-2.5 shadow-sm">
-              <AlertCircle size={18} className="mt-0.5 flex-shrink-0" />
-              <div className="flex flex-col gap-0.5">
-                <span className="font-extrabold">Falha de Transmissão</span>
-                <span>{erroEmissao}</span>
-              </div>
+        )}
+
+        {erroMsg && etapa !== 'invalidada' && (
+          <div className="mt-4 bg-warn-tint border border-warn/30 text-warn text-sm p-3 rounded-DEFAULT flex items-start gap-2">
+            <AlertCircle size={14} className="mt-0.5" /><span>{erroMsg}</span>
+          </div>
+        )}
+      </main>
+
+      {/* ===================== Cadeado JSON (bottom-left) ===================== */}
+      <button
+        onClick={abrirCadeado}
+        title="Área técnica"
+        className="fixed left-4 bottom-4 z-50 inline-flex items-center gap-1.5 font-mono text-[11px] font-medium text-muted/70 px-2.5 py-1.5 rounded-lg hover:bg-card hover:text-ink-soft hover:shadow-md transition-colors"
+      >
+        <Lock size={11} /> JSON
+      </button>
+
+      {/* Modal senha */}
+      {modalSenhaAberto && (
+        <div className="fixed inset-0 bg-ink/60 backdrop-blur-sm z-[100] grid place-items-center p-6"
+             onClick={(e) => { if (e.target === e.currentTarget) setModalSenhaAberto(false); }}>
+          <div className="bg-card rounded-DEFAULT p-7 shadow-2xl w-[min(460px,100%)]">
+            <div className="w-12 h-12 rounded-xl bg-bg grid place-items-center mb-4">
+              <Lock size={22} />
             </div>
-          )}
-
-          {resultado && (
-            <div className={`border rounded-xl p-5 shadow-sm flex flex-col gap-4 ${
-              resultado.status === 'processando'
-                ? 'bg-[#e8f0fe] border-[#b0cbfa] text-[#0d47a1]'
-                : resultado.sucesso 
-                ? 'bg-[#e6f4ea] border-[#a3cfbb] text-[#0f5132]' 
-                : 'bg-warn-tint border-[#f0c9c4] text-warn'
-            }`}>
-              <div className="flex items-start gap-3">
-                {resultado.status === 'processando' ? (
-                  <Loader2 size={24} className="animate-spin text-i9 flex-shrink-0 mt-0.5" />
-                ) : resultado.sucesso ? (
-                  <CheckCircle2 size={24} className="text-i9 flex-shrink-0 mt-0.5" />
-                ) : (
-                  <XCircle size={24} className="text-warn flex-shrink-0 mt-0.5" />
-                )}
-                <div className="flex-1 flex flex-col gap-1">
-                  <h3 className="text-md font-extrabold">
-                    {resultado.status === 'processando' 
-                      ? 'NF-e em Processamento' 
-                      : resultado.sucesso 
-                      ? 'Documento Autorizado com Sucesso!' 
-                      : 'Documento Rejeitado'}
-                  </h3>
-                  <p className="text-xs opacity-90">
-                    {resultado.status === 'processando'
-                      ? 'A nota fiscal modelo 55 foi enviada para a SEFAZ. O sistema está consultando o status automaticamente...'
-                      : resultado.sucesso 
-                      ? 'O documento fiscal foi validado e assinado digitalmente perante a SEFAZ.' 
-                      : resultado.mensagem
-                    }
-                  </p>
-                </div>
-              </div>
-
-              {resultado.sucesso && resultado.status !== 'processando' && (
-                <div className="flex flex-col gap-3 border-t border-[#a3cfbb] pt-4 mt-1 text-xs">
-                  <div className="flex justify-between font-mono bg-white/55 p-2.5 rounded-lg border border-[#a3cfbb]/30">
-                    <div className="flex flex-col gap-0.5">
-                      <span className="text-[10px] text-muted-foreground uppercase font-bold">Chave de Acesso</span>
-                      <span className="tracking-wider text-ink font-semibold">{resultado.chave}</span>
-                    </div>
-                    <div className="flex flex-col gap-0.5 text-right">
-                      <span className="text-[10px] text-muted-foreground uppercase font-bold">Nota / Série</span>
-                      <span className="text-ink font-bold">{resultado.numero} / S.{resultado.serie}</span>
-                    </div>
-                  </div>
-
-                  <div className="flex gap-2">
-                    <button
-                      onClick={baixarPDF}
-                      className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-i9 text-white font-bold hover:bg-i9-dark transition-colors text-center"
-                    >
-                      <ExternalLink size={14} />
-                      Visualizar DANFE (PDF)
-                    </button>
-                    <button
-                      onClick={baixarXML}
-                      className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-white border border-[#a3cfbb] text-ink font-bold hover:bg-[#d1e7dd] transition-colors text-center"
-                    >
-                      <Download size={14} />
-                      Baixar XML
-                    </button>
-                  </div>
-                </div>
-              )}
+            <h4 className="text-xl font-extrabold tracking-tight mb-2">Área técnica</h4>
+            <p className="text-sm text-ink-soft mb-4">
+              Aqui ficam os dados que o InnoSystem enviou e o payload transmitido à SEFAZ. Só
+              leitura — nada aqui altera a nota.
+            </p>
+            <input
+              ref={senhaRef}
+              type="password"
+              inputMode="numeric"
+              maxLength={12}
+              value={senhaInput}
+              onChange={(e) => { setSenhaInput(e.target.value); setErroSenha(''); }}
+              onKeyDown={(e) => e.key === 'Enter' && validarSenha()}
+              placeholder="••••••"
+              className="w-full font-mono text-lg text-center tracking-[0.3em] p-3.5 rounded-lg border-2 border-line bg-field focus:border-i9 focus:bg-white outline-none"
+              aria-label="Senha técnica"
+              autoComplete="off"
+            />
+            {erroSenha && <div className="text-warn text-xs mt-2 text-center">{erroSenha}</div>}
+            <div className="flex gap-2 mt-5">
+              <button onClick={() => setModalSenhaAberto(false)}
+                      className="flex-1 py-3 rounded-lg bg-bg text-ink-soft font-extrabold text-sm">
+                Cancelar
+              </button>
+              <button onClick={validarSenha}
+                      className="flex-1 py-3 rounded-lg bg-ink text-white font-extrabold text-sm">
+                Entrar
+              </button>
             </div>
-          )}
-
+          </div>
         </div>
+      )}
 
+      {/* Gaveta técnica */}
+      {gavetaAberta && (
+        <GavetaTecnica
+          jsonEntrada={rascunho?.json_venda || notaEmitida?.json_venda || ''}
+          payloadSaida={notaEmitida?.payload_enviado || rascunho?.payload_enviado || ''}
+          resposta={notaEmitida?.resposta_integradora || rascunho?.resposta_integradora || ''}
+          rascunhoId={rascunho?.id || notaEmitida?.id}
+          aba={abaGaveta}
+          onAba={setAbaGaveta}
+          onFechar={() => setGavetaAberta(false)}
+          onCopiar={(txt: string) => {
+            navigator.clipboard?.writeText(txt);
+            setToast('Copiado para a área de transferência.');
+          }}
+        />
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div className="fixed left-1/2 -translate-x-1/2 bottom-20 z-[130] bg-ink text-white px-5 py-3 rounded-DEFAULT text-sm shadow-2xl">
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ==================== Subcomponentes ====================
+
+function AlertCircle(props: any) {
+  // reuso do lucide (evita import duplo)
+  return <AlertTriangle {...props} />;
+}
+
+function ClienteCard({ cliente }: { cliente: any }) {
+  if (!cliente) {
+    return (
+      <div className="bg-i9-tint rounded-lg p-4 mb-4 text-sm text-ink-soft italic">
+        Consumidor não identificado (venda anônima).
+      </div>
+    );
+  }
+  const end = cliente.endereco || {};
+  return (
+    <div className="bg-i9-tint rounded-lg p-4 mb-4 flex justify-between items-start gap-4 flex-wrap">
+      <div>
+        <div className="text-[10px] font-bold uppercase tracking-wider text-muted mb-0.5">Destinatário</div>
+        <strong className="text-base font-extrabold">{cliente.nome || '—'}</strong>
+        {(end.logradouro || end.cidade) && (
+          <div className="text-xs text-ink-soft mt-1">
+            {[end.logradouro, end.numero].filter(Boolean).join(', ')}
+            {end.bairro && ` · ${end.bairro}`}
+            {end.cidade && ` · ${end.cidade}/${(end.uf || '').toUpperCase()}`}
+            {end.cep && ` · CEP ${end.cep}`}
+          </div>
+        )}
+        {cliente.email && (
+          <div className="inline-flex items-center gap-1.5 text-xs text-i9-dark mt-1.5">
+            <Mail size={12} /> {cliente.email}
+          </div>
+        )}
+      </div>
+      <div className="font-mono text-xs text-i9-dark whitespace-nowrap">
+        {cliente.cpf && <>CPF {cliente.cpf}</>}
+        {cliente.cnpj && <>CNPJ {cliente.cnpj}</>}
       </div>
     </div>
   );
 }
+
+function LinhaTotal({ rotulo, valor }: { rotulo: string; valor: number }) {
+  return (
+    <div className="flex justify-between text-sm text-ink-soft">
+      <span>{rotulo}</span>
+      <span className="font-mono">R$ {fmtMoeda(valor)}</span>
+    </div>
+  );
+}
+
+function BotaoEmitir({ disabled, onClick, primaria, titulo, sub }: any) {
+  return (
+    <button
+      disabled={disabled}
+      onClick={onClick}
+      className={
+        'flex flex-col items-center justify-center gap-0.5 font-extrabold rounded-lg py-4 px-4 transition-all disabled:opacity-40 disabled:cursor-not-allowed ' +
+        (primaria
+          ? 'bg-i9 text-white shadow-lg hover:bg-i9-dark active:translate-y-px'
+          : 'bg-white text-i9 border-[1.5px] border-line hover:border-i9 hover:bg-i9-tint')
+      }
+    >
+      <span className="text-base">{titulo}</span>
+      <small className="font-medium text-[11px] opacity-70 tracking-normal">{sub}</small>
+    </button>
+  );
+}
+
+function ResultadoTransmitindo() {
+  const passos = [
+    'Conferindo os dados da venda',
+    'Assinando com o certificado digital',
+    'Enviando para a SEFAZ',
+    'Aguardando o número de autorização',
+  ];
+  return (
+    <div className="bg-card border border-line rounded-DEFAULT shadow p-5">
+      <h4 className="text-lg font-extrabold tracking-tight mb-1">Transmitindo…</h4>
+      <p className="text-sm text-ink-soft mb-4">Não feche esta tela. Leva poucos segundos.</p>
+      <ul className="space-y-2">
+        {passos.map((p, i) => (
+          <li key={i} className="flex items-center gap-2.5 text-sm text-i9">
+            <Loader2 size={14} className="animate-spin" /> {p}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ResultadoProcessando({ active }: { active: boolean }) {
+  return (
+    <div className="bg-pend-tint border border-pend/20 rounded-DEFAULT p-5">
+      <h4 className="text-lg font-extrabold tracking-tight text-pend mb-1">Aguardando SEFAZ processar</h4>
+      <p className="text-sm text-ink-soft">
+        A nota foi enviada e está em fila na SEFAZ. Consulta automática a cada 3 segundos {active && '(polling ativo)'}.
+      </p>
+    </div>
+  );
+}
+
+function ResultadoAutorizada({ nota }: { nota: Rascunho }) {
+  const chave = nota.chave_acesso || '';
+  return (
+    <div className="bg-ok-tint border border-ok/30 rounded-DEFAULT p-5">
+      <h4 className="text-lg font-extrabold tracking-tight text-ok mb-1 inline-flex items-center gap-2">
+        <CheckCircle2 size={20} /> {nota.modelo === '55' ? 'NF-e' : 'NFC-e'} autorizada
+      </h4>
+      <p className="text-sm text-ink-soft mb-3">
+        Nota {nota.numero} · série {nota.serie} · autorizada pela SEFAZ.
+      </p>
+      {chave && (
+        <div className="bg-white/70 rounded-lg p-3">
+          <div className="text-[10px] font-bold uppercase tracking-wider text-muted mb-1">Chave de acesso</div>
+          <div className="font-mono text-xs tracking-wider break-all">{agrupar(chave)}</div>
+        </div>
+      )}
+      <div className="flex gap-2 flex-wrap mt-4">
+        <a href={`/documentos`} className="inline-flex items-center gap-1.5 bg-white text-ink px-3 py-2 rounded-lg text-sm font-semibold shadow-sm hover:shadow-md">
+          Ir para Central de Documentos
+        </a>
+        {chave && (
+          <button
+            onClick={() => navigator.clipboard?.writeText(chave)}
+            className="inline-flex items-center gap-1.5 bg-white text-ink px-3 py-2 rounded-lg text-sm font-semibold shadow-sm hover:shadow-md"
+          >
+            <Copy size={14} /> Copiar chave
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ResultadoRejeitada({ motivo, cstat, onExcluir }: { motivo: string; cstat: string; onExcluir: () => void }) {
+  return (
+    <div className="bg-warn-tint border border-warn/30 rounded-DEFAULT p-5">
+      <h4 className="text-lg font-extrabold tracking-tight text-warn mb-1 inline-flex items-center gap-2">
+        <XCircle size={20} /> A SEFAZ não autorizou esta nota
+      </h4>
+      <p className="text-sm text-ink-soft mb-3">Nenhum documento foi gerado e nenhum número foi consumido.</p>
+      <div className="bg-white/70 rounded-lg p-3">
+        {cstat && <div className="font-mono text-[11px] text-warn font-semibold uppercase tracking-wider mb-1">Rejeição {cstat}</div>}
+        <div className="text-sm">{motivo || 'Motivo não informado pela SEFAZ.'}</div>
+      </div>
+      <div className="flex gap-2 flex-wrap mt-4">
+        <button onClick={onExcluir}
+          className="inline-flex items-center gap-1.5 bg-warn text-white px-3 py-2 rounded-lg text-sm font-semibold">
+          Excluir e refazer no InnoSystem
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ResultadoInvalidada({ erro, onExcluir }: { erro: string; onExcluir: () => void }) {
+  return (
+    <div className="bg-warn-tint border border-warn/30 rounded-DEFAULT p-5">
+      <h4 className="text-lg font-extrabold tracking-tight text-warn mb-1 inline-flex items-center gap-2">
+        <ShieldAlert size={20} /> Esta venda não pôde ser transmitida
+      </h4>
+      <p className="text-sm text-ink-soft mb-3">Problema detectado antes do envio. A SEFAZ nem foi acionada.</p>
+      <div className="bg-white/70 rounded-lg p-3">
+        <div className="font-mono text-[11px] text-warn font-semibold uppercase tracking-wider mb-1">Validação interna</div>
+        <div className="text-sm whitespace-pre-wrap">{erro}</div>
+      </div>
+      <div className="flex gap-2 flex-wrap mt-4">
+        <button onClick={onExcluir}
+          className="inline-flex items-center gap-1.5 bg-warn text-white px-3 py-2 rounded-lg text-sm font-semibold">
+          Excluir e refazer no InnoSystem
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Área de preview lateral com toggle Cupom (NFC-e mod 65) / DANFE (NF-e mod 55).
+ * Renderiza HTML espelhando o layout real do documento. Antes da autorização
+ * é uma PRÉVIA do que vai sair; após autorização mostra chave/protocolo reais.
+ */
+function PreviewArea({ autorizada, nota, empresa, venda, valorTotal }: any) {
+  // Após emissão, força o modelo emitido; antes disso deixa o usuário escolher
+  const emitedModelo = (autorizada && nota?.modelo) ? String(nota.modelo) : null;
+  const [modelo, setModelo] = useState<'65' | '55'>(
+    (emitedModelo === '55' ? '55' : '65')
+  );
+  useEffect(() => {
+    if (emitedModelo === '55' || emitedModelo === '65') setModelo(emitedModelo as any);
+  }, [emitedModelo]);
+
+  return (
+    <div className="space-y-3">
+      {/* Toggle */}
+      <div className="bg-card border border-line rounded-DEFAULT shadow p-1 flex gap-1">
+        <button
+          onClick={() => setModelo('65')}
+          disabled={emitedModelo === '55'}
+          className={`flex-1 py-2 px-3 rounded text-xs font-bold uppercase tracking-wider transition ${
+            modelo === '65' ? 'bg-ink text-white' : 'text-muted hover:bg-bg disabled:opacity-40'
+          }`}
+        >
+          Cupom (NFC-e)
+        </button>
+        <button
+          onClick={() => setModelo('55')}
+          disabled={emitedModelo === '65'}
+          className={`flex-1 py-2 px-3 rounded text-xs font-bold uppercase tracking-wider transition ${
+            modelo === '55' ? 'bg-ink text-white' : 'text-muted hover:bg-bg disabled:opacity-40'
+          }`}
+        >
+          DANFE (NF-e)
+        </button>
+      </div>
+
+      {/* Selo do estado */}
+      <div className="text-[10px] font-bold uppercase tracking-wider text-center">
+        {autorizada
+          ? <span className="text-ok">✓ Autorizada — como saiu na SEFAZ</span>
+          : <span className="text-muted">Prévia — como vai sair ao emitir</span>}
+      </div>
+
+      {/* Documento */}
+      {modelo === '65'
+        ? <CupomNFCePreview autorizada={autorizada} nota={nota} empresa={empresa} venda={venda} valorTotal={valorTotal} />
+        : <DanfePreview autorizada={autorizada} nota={nota} empresa={empresa} venda={venda} valorTotal={valorTotal} />
+      }
+
+      {/* Ações pós-autorização */}
+      {autorizada && (
+        <div className="flex justify-center gap-1 flex-wrap">
+          <button className="inline-flex items-center gap-1 text-[11px] font-semibold text-ink-soft hover:text-ink px-2.5 py-1.5 rounded hover:bg-card">
+            <Printer size={12} /> Imprimir
+          </button>
+          <button className="inline-flex items-center gap-1 text-[11px] font-semibold text-ink-soft hover:text-ink px-2.5 py-1.5 rounded hover:bg-card">
+            <Download size={12} /> PDF
+          </button>
+          <button className="inline-flex items-center gap-1 text-[11px] font-semibold text-ink-soft hover:text-ink px-2.5 py-1.5 rounded hover:bg-card">
+            <Mail size={12} /> E-mail
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// -------------- Cupom NFC-e (estilo térmico) --------------
+function CupomNFCePreview({ autorizada, nota, empresa, venda, valorTotal }: any) {
+  const nomeEmp = (empresa?.nome_fantasia || empresa?.razao_social || 'EMPRESA').toString().toUpperCase();
+  const cnpj = empresa?.cnpj || '—';
+  const endereco = [empresa?.logradouro, empresa?.numero].filter(Boolean).join(', ');
+  const cidade = [empresa?.cidade, empresa?.uf].filter(Boolean).join('/');
+  const itens = (venda?.itens || []) as any[];
+  const desconto = Number(venda?.desconto || 0);
+  const pagamentos = (venda?.pagamentos || []) as any[];
+  const subtotal = valorTotal + desconto;
+  const cliente = venda?.cliente;
+
+  return (
+    <div className="bg-[#FBFAF7] px-5 py-6 font-mono text-[11px] leading-relaxed text-[#2A2A28] shadow-2xl relative">
+      {/* Serrilha superior */}
+      <div className="absolute -top-1.5 left-0 right-0 h-1.5"
+           style={{ background: 'radial-gradient(circle at 6px -1px, transparent 5px, #FBFAF7 5.5px) 0 0/12px 7px repeat-x' }} />
+
+      {/* Cabeçalho */}
+      <div className="text-center pb-2 border-b border-dashed border-[#C9C5BA]">
+        <b className="block text-[13px] tracking-wide">{nomeEmp}</b>
+        <span className="block text-[10px] text-[#6D6A62]">CNPJ {cnpj}</span>
+        {endereco && <span className="block text-[10px] text-[#6D6A62]">{endereco}</span>}
+        {cidade && <span className="block text-[10px] text-[#6D6A62]">{cidade}</span>}
+      </div>
+
+      {/* Título do documento */}
+      <div className="text-center py-2 text-[10px] text-[#6D6A62]">
+        DOCUMENTO AUXILIAR DA<br/>NOTA FISCAL DE CONSUMIDOR ELETRÔNICA
+      </div>
+      <div className="border-b border-dashed border-[#C9C5BA]" />
+
+      {/* Itens */}
+      <div className="py-2">
+        <div className="flex justify-between text-[10px] text-[#6D6A62] mb-1.5">
+          <span>ITEM · CÓD · DESCRIÇÃO</span><span>VALOR</span>
+        </div>
+        {itens.length === 0
+          ? <div className="text-[10px] text-[#6D6A62] italic">(sem itens)</div>
+          : itens.map((it, i) => {
+            const nome = (it.nome || it.descricao || 'ITEM').toString().toUpperCase().slice(0, 34);
+            const qtd = Number(it.quantidade || 0);
+            const vu = Number(it.valor_unitario || 0);
+            return (
+              <div key={i} className="mb-1.5">
+                <div>{String(i + 1).padStart(3, '0')} {it.codigo || '—'} {nome}</div>
+                <div className="flex justify-between">
+                  <span className="pl-4">{qtd} {(it.unidade || 'UN').toUpperCase()} x {fmtMoeda(vu)}</span>
+                  <span>{fmtMoeda(qtd * vu)}</span>
+                </div>
+              </div>
+            );
+          })}
+      </div>
+      <div className="border-b border-dashed border-[#C9C5BA]" />
+
+      {/* Totais */}
+      <div className="py-2 text-[11px]">
+        <div className="flex justify-between"><span>Qtd. total de itens</span><span>{itens.length}</span></div>
+        <div className="flex justify-between"><span>Subtotal</span><span>R$ {fmtMoeda(subtotal)}</span></div>
+        {desconto > 0 && <div className="flex justify-between"><span>Desconto</span><span>-{fmtMoeda(desconto)}</span></div>}
+        <div className="flex justify-between font-bold text-[14px] pt-1 mt-1 border-t border-dashed border-[#C9C5BA]">
+          <span>TOTAL R$</span><span>{fmtMoeda(valorTotal)}</span>
+        </div>
+        <div className="mt-1">
+          {pagamentos.map((p, i) => (
+            <div key={i} className="flex justify-between text-[10px]">
+              <span>{labelPagamento(p.meio_pagamento)}</span>
+              <span>{fmtMoeda(Number(p.valor || 0))}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="border-b border-dashed border-[#C9C5BA]" />
+
+      {/* Cliente */}
+      {cliente && (
+        <div className="py-2 text-[10px] text-center">
+          CONSUMIDOR: {(cliente.nome || 'NÃO IDENTIFICADO').toUpperCase()}
+          {cliente.cpf && <><br/>CPF {cliente.cpf}</>}
+          {cliente.cnpj && <><br/>CNPJ {cliente.cnpj}</>}
+        </div>
+      )}
+
+      {/* Rodapé — chave e QR */}
+      <div className="pt-2 text-[10px] text-center text-[#6D6A62] border-t border-dashed border-[#C9C5BA]">
+        {autorizada && nota?.chave_acesso ? (
+          <>
+            <div>Consulte pela chave de acesso em<br/>www.fazenda.<span>[uf]</span>.gov.br/nfce</div>
+            <div className="my-2 inline-block bg-white border border-[#DCD8CE] p-1.5">
+              <MiniQR />
+            </div>
+            <div className="tracking-wider break-all text-[9px]">{agrupar(nota.chave_acesso)}</div>
+            {nota.numero && <div className="mt-1">Nº {nota.numero} · SÉRIE {nota.serie || 1}</div>}
+          </>
+        ) : (
+          <div className="italic">Chave de acesso, QR e número virão após a autorização</div>
+        )}
+      </div>
+
+      {/* Selo autorizado */}
+      {autorizada && (
+        <div className="absolute top-[38%] left-1/2 -translate-x-1/2 -rotate-12 border-4 border-ok text-ok font-extrabold text-lg px-3 py-1 rounded opacity-90 bg-[#FBFAF7]/60 pointer-events-none tracking-wider">
+          AUTORIZADA
+        </div>
+      )}
+
+      {/* Serrilha inferior */}
+      <div className="absolute -bottom-1.5 left-0 right-0 h-1.5"
+           style={{ background: 'radial-gradient(circle at 6px 8px, transparent 5px, #FBFAF7 5.5px) 0 0/12px 7px repeat-x' }} />
+    </div>
+  );
+}
+
+// -------------- DANFE NF-e mod 55 (simplificado) --------------
+function DanfePreview({ autorizada, nota, empresa, venda, valorTotal }: any) {
+  const cliente = venda?.cliente;
+  const end = cliente?.endereco || {};
+  const itens = (venda?.itens || []) as any[];
+  const desconto = Number(venda?.desconto || 0);
+  const subtotal = valorTotal + desconto;
+  const chave = nota?.chave_acesso || '';
+
+  return (
+    <div className="bg-white p-2.5 font-mono text-[8.5px] leading-tight text-[#1a1a1a] shadow-2xl relative">
+      {/* Canhoto */}
+      <div className="border border-[#444] px-2 py-1.5 text-[6.5px] leading-relaxed mb-0.5">
+        RECEBEMOS DE <b>{(empresa?.razao_social || 'EMPRESA').toUpperCase()}</b> OS PRODUTOS CONSTANTES DA NOTA FISCAL INDICADA AO LADO
+        <div className="flex gap-1 mt-1">
+          <div className="border-t border-[#888] flex-1 pt-0.5 text-[5.5px] text-[#666]">DATA</div>
+          <div className="border-t border-[#888] flex-[2] pt-0.5 text-[5.5px] text-[#666]">IDENTIFICAÇÃO E ASSINATURA</div>
+        </div>
+      </div>
+      <div className="border-t border-dashed border-[#999] my-1" />
+
+      {/* Cabeçalho principal */}
+      <div className="grid grid-cols-[1.5fr_1.1fr_1.9fr] gap-0.5 mb-0.5">
+        <div className="border border-[#444] px-1.5 py-1 text-center">
+          <b className="block text-[10px]">{(empresa?.nome_fantasia || empresa?.razao_social || 'EMPRESA').toUpperCase()}</b>
+          <span className="block text-[6px] text-[#555]">{empresa?.logradouro || '—'}</span>
+          <span className="block text-[6px] text-[#555]">
+            {[empresa?.cidade, empresa?.uf].filter(Boolean).join('/')}
+            {empresa?.cep && ` — ${empresa.cep}`}
+          </span>
+        </div>
+        <div className="border border-[#444] p-1 text-center">
+          <b className="block text-[13px] tracking-wider">DANFE</b>
+          <span className="block text-[5.5px] text-[#555] leading-tight">Documento Auxiliar da<br/>Nota Fiscal Eletrônica</span>
+          <div className="flex justify-center gap-1 text-[6px] my-1 items-center">
+            <span>0-ENTRADA</span><span>1-SAÍDA</span>
+            <b className="border border-[#444] px-0.5">1</b>
+          </div>
+          <div className="text-[7px]">
+            Nº {nota?.numero ? String(nota.numero).padStart(9, '0') : '—'}<br/>
+            SÉRIE {nota?.serie || 1} · FOLHA 1/1
+          </div>
+        </div>
+        <div className="border border-[#444] p-1 flex flex-col justify-between">
+          <div className="flex gap-px h-6 mb-1 items-stretch">
+            {/* Barras fake determinísticas */}
+            {Array.from({ length: 60 }).map((_, i) => (
+              <i key={i} className="block bg-black"
+                 style={{ width: (i * 7 + 3) % 3 === 0 ? '2px' : '1px', opacity: (i * 11) % 5 === 0 ? 0.3 : 1 }} />
+            ))}
+          </div>
+          <div className="text-[7px] text-center break-all">{chave ? agrupar(chave) : '—'}</div>
+          <div className="text-[5.5px] text-[#555] text-center mt-1 leading-tight">
+            Consulta em www.nfe.fazenda.gov.br/portal
+          </div>
+        </div>
+      </div>
+
+      {/* Protocolo */}
+      <div className="border border-[#444] px-1.5 py-0.5 text-center text-[6.5px] bg-[#F4FAF6] mb-0.5">
+        {autorizada
+          ? 'PROTOCOLO DE AUTORIZAÇÃO DE USO — autorizada pela SEFAZ'
+          : 'PROTOCOLO DE AUTORIZAÇÃO DE USO — aguardando transmissão'}
+      </div>
+
+      {/* Destinatário */}
+      <div className="bg-[#e8e8e8] border border-[#444] border-b-0 text-[6px] font-bold px-1.5 py-0.5 uppercase tracking-wider mt-1">
+        Destinatário / Remetente
+      </div>
+      <div className="grid grid-cols-[2fr_1fr_1fr] gap-0.5">
+        <BoxDanfe rot="Nome / Razão Social" val={(cliente?.nome || '—').toUpperCase()} />
+        <BoxDanfe rot={cliente?.cnpj ? 'CNPJ' : 'CPF'} val={cliente?.cnpj || cliente?.cpf || '—'} />
+        <BoxDanfe rot="Data de emissão" val={new Date().toLocaleDateString('pt-BR')} />
+      </div>
+      <div className="grid grid-cols-[2.2fr_1fr_1fr_.9fr] gap-0.5 mt-0.5">
+        <BoxDanfe rot="Endereço" val={[end.logradouro, end.numero].filter(Boolean).join(', ') || '—'} />
+        <BoxDanfe rot="Município" val={(end.cidade || '—').toUpperCase()} />
+        <BoxDanfe rot="CEP" val={end.cep || '—'} />
+        <BoxDanfe rot="UF" val={(end.uf || '—').toUpperCase()} />
+      </div>
+
+      {/* Cálculo do imposto (simplificado) */}
+      <div className="bg-[#e8e8e8] border border-[#444] border-b-0 text-[6px] font-bold px-1.5 py-0.5 uppercase tracking-wider mt-1">
+        Cálculo do Imposto
+      </div>
+      <div className="grid grid-cols-4 gap-0.5">
+        <BoxDanfe rot="Base de cálculo ICMS" val="0,00" />
+        <BoxDanfe rot="Valor do ICMS" val="0,00" />
+        <BoxDanfe rot="Valor dos produtos" val={fmtMoeda(subtotal)} />
+        <BoxDanfe rot="Desconto" val={fmtMoeda(desconto)} />
+      </div>
+      <div className="grid grid-cols-4 gap-0.5 mt-0.5">
+        <BoxDanfe rot="Valor do frete" val="0,00" />
+        <BoxDanfe rot="Outras despesas" val="0,00" />
+        <BoxDanfe rot="Valor do IPI" val="0,00" />
+        <BoxDanfe rot="Total da nota" val={fmtMoeda(valorTotal)} destaque />
+      </div>
+
+      {/* Produtos */}
+      <div className="bg-[#e8e8e8] border border-[#444] border-b-0 text-[6px] font-bold px-1.5 py-0.5 uppercase tracking-wider mt-1">
+        Dados dos Produtos / Serviços
+      </div>
+      <table className="w-full border-collapse text-[6.5px]">
+        <thead>
+          <tr>
+            {['Código', 'Descrição', 'NCM', 'CFOP', 'Un', 'Qtd', 'V.Unit', 'V.Total'].map((h) => (
+              <th key={h} className="bg-[#eee] border border-[#444] px-1 py-0.5 font-bold text-[5.5px] uppercase">{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {itens.length === 0 ? (
+            <tr><td colSpan={8} className="border border-[#444] px-1 py-0.5 italic text-center text-[#666]">(sem itens)</td></tr>
+          ) : itens.map((it, i) => {
+            const qtd = Number(it.quantidade || 0);
+            const vu = Number(it.valor_unitario || 0);
+            return (
+              <tr key={i}>
+                <td className="border border-[#444] px-1 py-0.5">{it.codigo || '—'}</td>
+                <td className="border border-[#444] px-1 py-0.5">{(it.nome || it.descricao || 'ITEM').toString().toUpperCase()}</td>
+                <td className="border border-[#444] px-1 py-0.5">{(it.ncm || '').toString().slice(0, 8) || '—'}</td>
+                <td className="border border-[#444] px-1 py-0.5">{it.cfop || '—'}</td>
+                <td className="border border-[#444] px-1 py-0.5">{(it.unidade || 'UN').toUpperCase()}</td>
+                <td className="border border-[#444] px-1 py-0.5 text-right">{qtd}</td>
+                <td className="border border-[#444] px-1 py-0.5 text-right">{fmtMoeda(vu)}</td>
+                <td className="border border-[#444] px-1 py-0.5 text-right">{fmtMoeda(qtd * vu)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      {/* Selo autorizado */}
+      {autorizada && (
+        <div className="absolute top-[42%] left-1/2 -translate-x-1/2 -rotate-12 border-4 border-ok text-ok font-extrabold text-xl px-4 py-1 rounded opacity-90 bg-white/70 pointer-events-none tracking-wider">
+          AUTORIZADA
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BoxDanfe({ rot, val, destaque }: { rot: string; val: string; destaque?: boolean }) {
+  return (
+    <div className={`border border-[#444] px-1 py-0.5 ${destaque ? 'bg-[#F2F5FA]' : ''}`}>
+      <span className="block text-[5.5px] text-[#555] uppercase tracking-wider leading-none">{rot}</span>
+      <span className={`block text-[8px] whitespace-nowrap overflow-hidden text-ellipsis ${destaque ? 'font-bold' : ''}`}>{val}</span>
+    </div>
+  );
+}
+
+// QR fake determinístico — só visual, não escaneável
+function MiniQR() {
+  const s = 21;
+  let seed = 7;
+  const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  const cels: ReactElement[] = [];
+  for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+    const canto = (x < 7 && y < 7) || (x > s - 8 && y < 7) || (x < 7 && y > s - 8);
+    const on = canto
+      ? (x % 6 === 0 || y % 6 === 0 || (x > 1 && x < 5 && y > 1 && y < 5) || (x > s - 7 && x < s - 2 && y > 1 && y < 5) || (x > 1 && x < 5 && y > s - 7 && y < s - 2))
+      : rnd() > 0.52;
+    if (on) cels.push(<rect key={`${x}-${y}`} x={x} y={y} width={1} height={1} />);
+  }
+  return <svg viewBox={`0 0 ${s} ${s}`} width={68} height={68} fill="#111">{cels}</svg>;
+}
+
+function labelPagamento(cod: string): string {
+  const map: Record<string, string> = {
+    '01': 'Dinheiro', '02': 'Cheque', '03': 'Crédito', '04': 'Débito', '05': 'Crédito Loja',
+    '10': 'Vale Alimentação', '11': 'Vale Refeição', '12': 'Vale Presente', '13': 'Vale Combustível',
+    '15': 'Boleto', '17': 'PIX', '18': 'Transferência bancária', '19': 'Cashback', '90': 'Sem pagamento', '99': 'Outros',
+  };
+  return map[String(cod)] || `Meio ${cod}`;
+}
+
+// ==================== Gaveta técnica ====================
+function GavetaTecnica({
+  jsonEntrada, payloadSaida, resposta, rascunhoId, aba, onAba, onFechar, onCopiar,
+}: {
+  jsonEntrada: string;
+  payloadSaida: string;
+  resposta: string;
+  rascunhoId?: number;
+  aba: 'ent' | 'sai' | 'val' | 'log';
+  onAba: (a: 'ent' | 'sai' | 'val' | 'log') => void;
+  onFechar: () => void;
+  onCopiar: (txt: string) => void;
+}) {
+  const pretty = (raw: string) => {
+    try { return JSON.stringify(JSON.parse(raw), null, 2); } catch { return raw || '(vazio)'; }
+  };
+  const respostaJson = pretty(resposta);
+  const respostaObj = resposta ? (() => { try { return JSON.parse(resposta); } catch { return {}; } })() : {};
+
+  const validacoes = [
+    ['INN-101', 'Forma de pagamento na tabela tPag', check(!!jsonEntrada && !!getIn(jsonEntrada, ['pagamentos', 0, 'meio_pagamento']))],
+    ['INN-102', 'NCM presente em todos os itens', check(false, 'depende da regra fiscal — validado no montar_payload_nfce')],
+    ['INN-103', 'CPF/CNPJ do destinatário válido', check(!!getIn(jsonEntrada, ['cliente', 'cpf']) || !!getIn(jsonEntrada, ['cliente', 'cnpj']))],
+    ['INN-109', 'Endereço completo (só NF-e)', check(!!getIn(jsonEntrada, ['cliente', 'endereco', 'logradouro']))],
+    ['INN-110', 'Rascunho existente', check(!!rascunhoId)],
+  ];
+
+  return (
+    <div className="fixed top-0 right-0 bottom-0 w-[min(620px,100%)] bg-[#0A1729] text-[#DCE6F5] z-[110] flex flex-col shadow-2xl animate-slide-in">
+      <header className="px-6 py-5 border-b border-white/10 flex items-center gap-3">
+        <div>
+          <h4 className="font-extrabold text-base tracking-tight m-0">
+            Área técnica {rascunhoId ? `· venda #${rascunhoId}` : ''}
+          </h4>
+          <div className="text-xs text-[#7D93B4] mt-0.5">
+            Acesso registrado · {new Date().toLocaleString('pt-BR')}
+          </div>
+        </div>
+        <button onClick={onFechar} className="ml-auto text-[#7D93B4] hover:text-white text-2xl px-2 rounded">×</button>
+      </header>
+
+      <div className="flex gap-1 px-6 pt-3 flex-wrap">
+        {[
+          ['ent', 'Como chegou'],
+          ['sai', 'Como foi enviado'],
+          ['val', 'Validações'],
+          ['log', 'Linha do tempo'],
+        ].map(([id, label]) => (
+          <button
+            key={id}
+            onClick={() => onAba(id as any)}
+            className={`text-xs font-semibold px-3 py-2 rounded-lg ${
+              aba === id ? 'bg-white/10 text-white' : 'text-[#7D93B4] hover:text-white'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex-1 overflow-auto px-6 py-4">
+        {aba === 'ent' && (
+          <>
+            <div className="bg-gold/20 text-[#E8B45E] rounded-lg p-3 text-xs mb-3 leading-relaxed">
+              Payload bruto recebido do InnoSystem. Só leitura — pra corrigir, exclua a venda e refaça na origem.
+            </div>
+            <pre className="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words bg-black/30 rounded-DEFAULT p-4 text-[#C8D6EC] max-h-full">
+              {pretty(jsonEntrada)}
+            </pre>
+          </>
+        )}
+        {aba === 'sai' && (
+          <>
+            <div className="bg-i9/25 text-[#9DBEFB] rounded-lg p-3 text-xs mb-3 leading-relaxed">
+              Payload já mapeado para o layout da SEFAZ. Só existe depois de tentar emitir.
+            </div>
+            <pre className="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words bg-black/30 rounded-DEFAULT p-4 text-[#C8D6EC] max-h-full">
+              {payloadSaida ? pretty(payloadSaida) : '(ainda não transmitido)'}
+            </pre>
+          </>
+        )}
+        {aba === 'val' && (
+          <>
+            <div className="bg-gold/20 text-[#E8B45E] rounded-lg p-3 text-xs mb-3 leading-relaxed">
+              Checagens rápidas do payload. Regras completas (INN-101..110) rodam no backend.
+            </div>
+            <div className="space-y-0">
+              {validacoes.map(([cod, desc, res]: any, i) => (
+                <div key={i} className={`flex gap-3 items-start py-2.5 border-b border-white/5 text-xs ${res.ok ? '' : 'text-[#F0B0A4]'}`}>
+                  <span className={`w-5 h-5 rounded-full grid place-items-center flex-shrink-0 mt-0.5 ${res.ok ? 'bg-ok/20 text-ok' : 'bg-warn/25 text-[#F08D7E]'}`}>
+                    {res.ok ? <CheckCircle2 size={12}/> : <XCircle size={12}/>}
+                  </span>
+                  <span className="font-mono text-[#7D93B4] w-16 flex-shrink-0">{cod}</span>
+                  <span className="flex-1">
+                    {desc}
+                    <span className="block text-[#7D93B4] text-[11px] mt-0.5">{res.detalhe}</span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        {aba === 'log' && (
+          <>
+            <div className="bg-white/5 text-[#9DB3D1] rounded-lg p-3 text-xs mb-3 leading-relaxed">
+              Resposta da ACBr/SEFAZ (bruta). Vazia se ainda não transmitiu.
+            </div>
+            <pre className="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-words bg-black/30 rounded-DEFAULT p-4 text-[#C8D6EC] max-h-full">
+              {resposta ? respostaJson : '(sem resposta ainda)'}
+            </pre>
+            {respostaObj?.autorizacao?.motivo_status && (
+              <div className="mt-3 text-xs text-[#B7C9E4]">
+                <b>cStat {respostaObj.autorizacao.codigo_status}:</b> {respostaObj.autorizacao.motivo_status}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="px-6 py-4 border-t border-white/10 flex gap-2 flex-wrap">
+        <button
+          onClick={() => onCopiar(aba === 'ent' ? pretty(jsonEntrada) : aba === 'sai' ? pretty(payloadSaida) : respostaJson)}
+          className="text-xs font-semibold px-3 py-2 rounded-lg bg-white/10 text-[#C8D6EC] hover:bg-white/20"
+        >
+          Copiar JSON desta aba
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function getIn(rawJson: string, path: (string | number)[]) {
+  try {
+    let cur: any = JSON.parse(rawJson);
+    for (const k of path) {
+      if (cur == null) return null;
+      cur = cur[k as any];
+    }
+    return cur;
+  } catch {
+    return null;
+  }
+}
+function check(ok: boolean, detalhe?: string) { return { ok, detalhe: detalhe || (ok ? 'OK' : 'Verificar') }; }

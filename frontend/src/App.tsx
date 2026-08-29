@@ -9,6 +9,7 @@ import EmpresaForm from './pages/empresas/EmpresaForm';
 import RegrasFiscaisList from './pages/empresas/RegrasFiscaisList';
 import RegraFiscalForm from './pages/empresas/RegraFiscalForm';
 import EmitirNota from './pages/empresas/EmitirNota';
+import EmitirNotaAdmin from './pages/empresas/EmitirNotaAdmin';
 import EmitirDevolucao from './pages/empresas/EmitirDevolucao';
 import CentralDocumentos from './pages/empresas/CentralDocumentos';
 import NotasRecebidas from './pages/documentos/NotasRecebidas';
@@ -37,6 +38,8 @@ export default function App() {
           <Route path="empresas/:id/regras/nova" element={<RegraFiscalForm />} />
           <Route path="empresas/:id/regras/:regraId" element={<RegraFiscalForm />} />
           <Route path="emitir" element={<EmitirNota />} />
+          {/* Tela dev (JSON/manual). Gated por senha 010894 dentro da própria página. */}
+          <Route path="emitir/admin" element={<EmitirNotaAdmin />} />
           <Route path="emitir/devolucao" element={<EmitirDevolucao />} />
           <Route path="documentos" element={<CentralDocumentos />} />
           <Route path="documentos/rascunhos" element={<NotasRecebidas />} />

@@ -31,14 +31,23 @@ def _float(elem: Optional[ET.Element], path: str, default: float = 0.0) -> float
         return default
 
 
-def cfop_inverso(cfop_original: Optional[str]) -> Optional[str]:
-    """Sugere CFOP de devolução a partir do CFOP de venda.
+def cfop_inverso(
+    cfop_original: Optional[str],
+    uf_emit: Optional[str] = None,
+    uf_dest: Optional[str] = None,
+) -> Optional[str]:
+    """Sugere CFOP de devolução a partir do CFOP de venda, respeitando UF.
 
-    Regra geral: troca a primeira classe do CFOP (saída→entrada).
-    5xxx (saída dentro UF)   → 1xxx (entrada dentro UF)
-    6xxx (saída interestadual)→ 2xxx (entrada interestadual)
-    7xxx (saída exterior)    → 3xxx (entrada exterior)
-    Casos comuns têm mapeamento direto pra CFOP específico de devolução.
+    Regra geral: troca a primeira classe do CFOP (saída ↔ entrada).
+    5xxx (saída interna)       → 1xxx (entrada interna)
+    6xxx (saída interestadual) → 2xxx (entrada interestadual)
+    7xxx (saída exterior)      → 3xxx (entrada exterior)
+
+    Se `uf_emit` e `uf_dest` forem passados, corrige a classe conforme a UF:
+    - UF iguais  → força classe 1 (entrada) ou 5 (saída) conforme direção
+    - UF difere  → força classe 2 (entrada) ou 6 (saída)
+
+    Sem UF: mantém comportamento antigo (só troca classe do CFOP original).
     """
     if not cfop_original or len(cfop_original) != 4 or not cfop_original.isdigit():
         return None
@@ -50,16 +59,39 @@ def cfop_inverso(cfop_original: Optional[str]) -> Optional[str]:
         "6403": "2411", "6949": "2949",
     }
     if cfop_original in mapa_direto:
-        return mapa_direto[cfop_original]
+        candidato = mapa_direto[cfop_original]
+    else:
+        primeira = cfop_original[0]
+        sufixo = cfop_original[1:]
+        if primeira == "5":
+            candidato = "1" + sufixo
+        elif primeira == "6":
+            candidato = "2" + sufixo
+        elif primeira == "7":
+            candidato = "3" + sufixo
+        elif primeira in ("1", "2"):
+            # CFOP original já é de entrada (ex: nota de compra sendo devolvida) — vai virar saída.
+            candidato = "5" + sufixo if primeira == "1" else "6" + sufixo
+        else:
+            return None
 
-    primeira = cfop_original[0]
-    if primeira == "5":
-        return "1" + cfop_original[1:]
-    if primeira == "6":
-        return "2" + cfop_original[1:]
-    if primeira == "7":
-        return "3" + cfop_original[1:]
-    return None
+    # Se UF foi passada, ajusta a classe conforme direção
+    if uf_emit and uf_dest:
+        uf_emit_up = uf_emit.strip().upper()
+        uf_dest_up = uf_dest.strip().upper()
+        if uf_emit_up and uf_dest_up:
+            interestadual = uf_emit_up != uf_dest_up
+            primeira = candidato[0]
+            sufixo = candidato[1:]
+            if primeira == "1" and interestadual:
+                candidato = "2" + sufixo
+            elif primeira == "2" and not interestadual:
+                candidato = "1" + sufixo
+            elif primeira == "5" and interestadual:
+                candidato = "6" + sufixo
+            elif primeira == "6" and not interestadual:
+                candidato = "5" + sufixo
+    return candidato
 
 
 def _extrair_destinatario_de_emitente(root: ET.Element) -> dict:
@@ -85,7 +117,11 @@ def _extrair_destinatario_de_emitente(root: ET.Element) -> dict:
     }
 
 
-def _extrair_itens(root: ET.Element) -> list:
+def _extrair_itens(
+    root: ET.Element,
+    uf_emit: Optional[str] = None,
+    uf_dest: Optional[str] = None,
+) -> list:
     itens = []
     for det in root.findall(".//n:det", NS):
         prod = det.find("n:prod", NS)
@@ -94,7 +130,7 @@ def _extrair_itens(root: ET.Element) -> list:
             continue
 
         cfop_orig = _text(prod, "n:CFOP")
-        cfop_dev = cfop_inverso(cfop_orig) or (cfop_orig or "")
+        cfop_dev = cfop_inverso(cfop_orig, uf_emit, uf_dest) or (cfop_orig or "")
 
         # ICMS — tenta CST (regime normal) e CSOSN (Simples)
         cst_csosn = None
@@ -219,8 +255,12 @@ def parse_nfe_xml(xml_bytes: bytes) -> dict:
     nat_op_orig = _text(root, ".//n:ide/n:natOp") or "VENDA"
     natureza_devolucao = f"DEVOLUCAO - {nat_op_orig}"[:120]
 
+    # UF emit vs dest da NF-e original — usado pra corrigir CFOP interna/interestadual
+    uf_emit_orig = _text(root, ".//n:emit/n:enderEmit/n:UF")
+    uf_dest_orig = _text(root, ".//n:dest/n:enderDest/n:UF")
+
     destinatario = _extrair_destinatario_de_emitente(root)
-    itens = _extrair_itens(root)
+    itens = _extrair_itens(root, uf_emit=uf_emit_orig, uf_dest=uf_dest_orig)
     valor_total = _float(root, ".//n:total/n:ICMSTot/n:vNF")
 
     return {

@@ -33,13 +33,32 @@ class NotaCancelar(BaseModel):
         orm_mode = True
 
 
+class EnderecoCliente(BaseModel):
+    """Endereço do destinatário (grupo <enderDest> da NF-e).
+
+    Obrigatório em NF-e mod 55 (SEFAZ rejeita com cStat 726 se faltar). Em NFC-e
+    mod 65 é opcional — consumidor anônimo omite o bloco inteiro.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    logradouro: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    uf: Optional[str] = None  # 2 letras (ex: "MG")
+    cep: Optional[str] = None  # 8 dígitos
+    codigo_municipio: Optional[str] = None  # IBGE 7 dígitos; se omitido, backend usa o do emitente
+
+
 class ReceberVendaCliente(BaseModel):
-    # Aceita campos extras (endereco, email, etc.) preservados no json_venda.
+    # Aceita campos extras (email, telefone, etc.) preservados no json_venda.
     model_config = ConfigDict(extra="allow")
 
     nome: str
     cpf: Optional[str] = None
     cnpj: Optional[str] = None
+    endereco: Optional[EnderecoCliente] = None
 
 
 class ReceberVendaItem(BaseModel):
@@ -122,6 +141,39 @@ class DevolucaoItemInput(BaseModel):
     ipi_enquadramento: Optional[str] = None  # cEnq (default "999")
 
 
+class TransporteInput(BaseModel):
+    """Dados de transporte da NF-e (grupo <transp> na SEFAZ).
+
+    - `mod_frete`: 0=por conta do emitente (CIF), 1=por conta do destinatário (FOB),
+      2=por conta de terceiros, 3=próprio do remetente, 4=próprio do destinatário,
+      9=sem frete (default).
+    - Transportador, veículo e volume são opcionais; só entram no XML se preenchidos.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    mod_frete: int = 9
+
+    # Transportador
+    transportador_cnpj: Optional[str] = None
+    transportador_cpf: Optional[str] = None
+    transportador_nome: Optional[str] = None
+    transportador_ie: Optional[str] = None
+    transportador_endereco: Optional[str] = None
+    transportador_municipio: Optional[str] = None
+    transportador_uf: Optional[str] = None
+
+    # Veículo
+    veiculo_placa: Optional[str] = None
+    veiculo_uf: Optional[str] = None
+    veiculo_rntc: Optional[str] = None
+
+    # Volume
+    volume_qtd: Optional[int] = None
+    volume_especie: Optional[str] = None  # "CX", "PC", etc
+    volume_peso_liquido: Optional[float] = None
+    volume_peso_bruto: Optional[float] = None
+
+
 class DevolucaoCreate(BaseModel):
     """Payload de emissão de NF-e de devolução (mod 55, finNFe=4)."""
     model_config = ConfigDict(extra="allow")
@@ -131,6 +183,7 @@ class DevolucaoCreate(BaseModel):
     natureza_operacao: str = "DEVOLUCAO DE MERCADORIA"
     destinatario: DestinatarioInput
     itens: List[DevolucaoItemInput] = Field(min_length=1)
+    transporte: Optional[TransporteInput] = None
 
 
 class DevolucaoPreviewResponse(BaseModel):

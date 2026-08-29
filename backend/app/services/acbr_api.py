@@ -534,11 +534,18 @@ class ACBrAPIService:
             ncm = "".join(filter(str.isdigit, ncm))[:8]
             cfop = "".join(filter(str.isdigit, regra.cfop))[:4]
 
+            # xProd: aceitar `nome` (schema canônico do InnoSystem) OU `descricao`
+            # (usado pelo motor de devolução e por alguns integradores externos).
+            # `dict.get()` só cai no default se a chave sumir — string vazia passa
+            # batido e o SEFAZ recebe xProd="" ou "ITEM SEM NOME" na DANFE.
+            nome_item = (item.get("nome") or item.get("descricao") or "").strip()
+            if not nome_item:
+                nome_item = f"ITEM {i}"
             prod: Dict[str, Any] = {
                 "cProd": item.get("codigo", f"PROD{i}"),
                 "cEAN": "SEM GTIN",
                 "cEANTrib": "SEM GTIN",
-                "xProd": item.get("nome", "Item sem Nome").upper(),
+                "xProd": nome_item.upper(),
                 "NCM": ncm,
                 "CFOP": cfop,
                 "uCom": item.get("unidade", "UN").upper(),
@@ -656,41 +663,84 @@ class ACBrAPIService:
         # dest: só incluir se houver CPF/CNPJ. Consumidor anônimo em NFC-e omite o bloco.
         # A ordem dos elementos importa: CPF/CNPJ/idEstrangeiro DEVE vir antes de xNome.
         dest = None
-        cliente = venda.get("cliente")
-        if cliente:
-            cpf = "".join(filter(str.isdigit, cliente.get("cpf") or ""))
-            cnpj_cli = "".join(filter(str.isdigit, cliente.get("cnpj") or ""))
-            if cpf and len(cpf) == 11:
-                dest = {"CPF": cpf, "xNome": cliente.get("nome", "CONSUMIDOR").upper(), "indIEDest": 9}
-            elif cnpj_cli and len(cnpj_cli) == 14:
-                dest = {"CNPJ": cnpj_cli, "xNome": cliente.get("nome", "CONSUMIDOR").upper(), "indIEDest": 9}
-            # sem doc → deixa dest = None (consumidor anônimo)
+        cliente = venda.get("cliente") or {}
+        cpf = "".join(filter(str.isdigit, cliente.get("cpf") or ""))
+        cnpj_cli = "".join(filter(str.isdigit, cliente.get("cnpj") or ""))
+        if cpf and len(cpf) == 11:
+            dest = {"CPF": cpf, "xNome": cliente.get("nome", "CONSUMIDOR").upper(), "indIEDest": 9}
+        elif cnpj_cli and len(cnpj_cli) == 14:
+            dest = {"CNPJ": cnpj_cli, "xNome": cliente.get("nome", "CONSUMIDOR").upper(), "indIEDest": 9}
+        # sem doc → dest = None (aceito só em NFC-e como consumidor anônimo)
 
-            # NF-e (mod 55) exige `enderDest`. SEFAZ rejeita com cStat 726
-            # ("NF-e sem a informacao de endereco do destinatario") se omitido.
-            # NFC-e (mod 65) NÃO exige — só incluir quando cliente enviou endereço.
-            if dest is not None:
-                end_cli = cliente.get("endereco") or {}
-                tem_end = bool(end_cli.get("logradouro") or end_cli.get("cep"))
-                if modelo == 55 or tem_end:
-                    # Fallback: quando o usuário não informou, usar a UF/município do emitente
-                    # (mínimo aceito pelo schema em homologação). Em produção o endereço
-                    # real do destinatário deve vir do cadastro.
-                    ender_dest = {
-                        "xLgr": (end_cli.get("logradouro") or "NAO INFORMADO").upper()[:60],
-                        "nro": str(end_cli.get("numero") or "SN")[:60],
-                        "xBairro": (end_cli.get("bairro") or "NAO INFORMADO").upper()[:60],
-                        "cMun": end_cli.get("codigo_municipio") or cod_mun_uf,
-                        "xMun": (end_cli.get("cidade") or empresa.cidade or "NAO INFORMADO").upper()[:60],
-                        "UF": (end_cli.get("uf") or uf_emit).upper(),
-                        "CEP": "".join(filter(str.isdigit, end_cli.get("cep") or empresa.cep or "")),
-                        "cPais": 1058,
-                        "xPais": "BRASIL",
-                    }
-                    complemento = end_cli.get("complemento")
-                    if complemento:
-                        ender_dest["xCpl"] = str(complemento).upper()[:60]
-                    dest["enderDest"] = ender_dest
+        # NF-e (mod 55) exige destinatário identificado E endereço completo.
+        # SEFAZ rejeita com cStat 726 ("NF-e sem a informacao de endereco do
+        # destinatario") se omitido. Aceitar fallback "NAO INFORMADO" é ilusão
+        # de sucesso em homologação — em produção quebra e gera doc inválido.
+        if modelo == 55 and dest is None:
+            raise ValueError(
+                "NF-e (modelo 55) exige destinatário com CPF ou CNPJ válido. "
+                "Preencha os dados do cliente antes de emitir."
+            )
+
+        if dest is not None:
+            end_cli = cliente.get("endereco") or {}
+            end_logradouro = (end_cli.get("logradouro") or "").strip()
+            end_bairro = (end_cli.get("bairro") or "").strip()
+            end_cidade = (end_cli.get("cidade") or "").strip()
+            end_uf = (end_cli.get("uf") or "").strip().upper()
+            end_cep = "".join(filter(str.isdigit, end_cli.get("cep") or ""))
+
+            if modelo == 55:
+                # Todos os campos essenciais são obrigatórios — sem fallback silencioso.
+                faltando = []
+                if not end_logradouro:
+                    faltando.append("logradouro")
+                if not end_bairro:
+                    faltando.append("bairro")
+                if not end_cidade:
+                    faltando.append("cidade")
+                if not end_uf or len(end_uf) != 2:
+                    faltando.append("UF")
+                if not end_cep or len(end_cep) != 8:
+                    faltando.append("CEP")
+                if faltando:
+                    raise ValueError(
+                        "NF-e (modelo 55) exige endereço completo do destinatário. "
+                        f"Campos ausentes ou inválidos: {', '.join(faltando)}."
+                    )
+                ender_dest = {
+                    "xLgr": end_logradouro.upper()[:60],
+                    "nro": str(end_cli.get("numero") or "SN")[:60],
+                    "xBairro": end_bairro.upper()[:60],
+                    "cMun": end_cli.get("codigo_municipio") or cod_mun_uf,
+                    "xMun": end_cidade.upper()[:60],
+                    "UF": end_uf,
+                    "CEP": end_cep,
+                    "cPais": 1058,
+                    "xPais": "BRASIL",
+                }
+                complemento = end_cli.get("complemento")
+                if complemento:
+                    ender_dest["xCpl"] = str(complemento).upper()[:60]
+                dest["enderDest"] = ender_dest
+            elif end_logradouro or end_cep:
+                # NFC-e (mod 65) só inclui enderDest se o cliente enviou algum dado
+                # de endereço — caso contrário omite o bloco (consumidor local).
+                ender_dest = {
+                    "xLgr": (end_logradouro or "NAO INFORMADO").upper()[:60],
+                    "nro": str(end_cli.get("numero") or "SN")[:60],
+                    "xBairro": (end_bairro or "NAO INFORMADO").upper()[:60],
+                    "cMun": end_cli.get("codigo_municipio") or cod_mun_uf,
+                    "xMun": (end_cidade or empresa.cidade or "NAO INFORMADO").upper()[:60],
+                    "UF": (end_uf or uf_emit).upper(),
+                    "CEP": end_cep or "".join(filter(str.isdigit, empresa.cep or "")),
+                    "cPais": 1058,
+                    "xPais": "BRASIL",
+                }
+                complemento = end_cli.get("complemento")
+                if complemento:
+                    ender_dest["xCpl"] = str(complemento).upper()[:60]
+                dest["enderDest"] = ender_dest
 
         v_nf = _r(v_prod - v_desc + tot_v_st + tot_v_ipi + tot_v_ii - tot_v_icms_deson)
 
@@ -783,6 +833,80 @@ class ACBrAPIService:
     # ------------------------------------------------------------------
     # Payload de NF-e de DEVOLUÇÃO (mod 55, finNFe=4)
     # ------------------------------------------------------------------
+    def _montar_transp(self, dados_transporte: Any) -> Dict[str, Any]:
+        """Monta o grupo <transp> a partir de um TransporteInput.
+
+        Se `dados_transporte` for None ou mod_frete=9 sem campos preenchidos,
+        retorna `{"modFrete": 9}` (sem frete). Caso contrário, monta
+        `transporta`/`veicTransp`/`vol` com os campos presentes.
+        """
+        if dados_transporte is None:
+            return {"modFrete": 9}
+
+        mod_frete = getattr(dados_transporte, "mod_frete", 9)
+        transp: Dict[str, Any] = {"modFrete": int(mod_frete)}
+
+        # transporta: CNPJ/CPF, nome, IE, endereço, município, UF
+        cnpj_t = "".join(filter(str.isdigit, getattr(dados_transporte, "transportador_cnpj", None) or ""))
+        cpf_t = "".join(filter(str.isdigit, getattr(dados_transporte, "transportador_cpf", None) or ""))
+        nome_t = (getattr(dados_transporte, "transportador_nome", None) or "").strip()
+        ie_t = (getattr(dados_transporte, "transportador_ie", None) or "").strip().upper()
+        end_t = (getattr(dados_transporte, "transportador_endereco", None) or "").strip()
+        mun_t = (getattr(dados_transporte, "transportador_municipio", None) or "").strip()
+        uf_t = (getattr(dados_transporte, "transportador_uf", None) or "").strip().upper()
+
+        transporta: Dict[str, Any] = {}
+        if cnpj_t and len(cnpj_t) == 14:
+            transporta["CNPJ"] = cnpj_t
+        elif cpf_t and len(cpf_t) == 11:
+            transporta["CPF"] = cpf_t
+        if nome_t:
+            transporta["xNome"] = nome_t.upper()[:60]
+        if ie_t and ie_t != "ISENTO":
+            transporta["IE"] = "".join(filter(str.isdigit, ie_t))
+        if end_t:
+            transporta["xEnder"] = end_t.upper()[:60]
+        if mun_t:
+            transporta["xMun"] = mun_t.upper()[:60]
+        if uf_t:
+            transporta["UF"] = uf_t
+
+        if transporta:
+            transp["transporta"] = transporta
+
+        # veicTransp: placa, UF, RNTC
+        placa = (getattr(dados_transporte, "veiculo_placa", None) or "").strip().upper().replace("-", "").replace(" ", "")
+        uf_v = (getattr(dados_transporte, "veiculo_uf", None) or "").strip().upper()
+        rntc = (getattr(dados_transporte, "veiculo_rntc", None) or "").strip()
+        veic: Dict[str, Any] = {}
+        if placa:
+            veic["placa"] = placa
+        if uf_v:
+            veic["UF"] = uf_v
+        if rntc:
+            veic["RNTC"] = rntc
+        if veic:
+            transp["veicTransp"] = veic
+
+        # vol: qtd, espécie, peso líquido, peso bruto
+        qtd_v = getattr(dados_transporte, "volume_qtd", None)
+        esp = (getattr(dados_transporte, "volume_especie", None) or "").strip()
+        pl = getattr(dados_transporte, "volume_peso_liquido", None)
+        pb = getattr(dados_transporte, "volume_peso_bruto", None)
+        vol: Dict[str, Any] = {}
+        if qtd_v is not None and int(qtd_v) > 0:
+            vol["qVol"] = int(qtd_v)
+        if esp:
+            vol["esp"] = esp.upper()[:60]
+        if pl is not None and float(pl) > 0:
+            vol["pesoL"] = float(pl)
+        if pb is not None and float(pb) > 0:
+            vol["pesoB"] = float(pb)
+        if vol:
+            transp["vol"] = [vol]
+
+        return transp
+
     def _icms_devolucao(self, cst_csosn: str, aliquota: float, valor_item: float) -> Dict[str, Any]:
         """Monta o grupo ICMS pra devolução usando CST/CSOSN + alíquota espelhados do XML.
 
@@ -1062,7 +1186,7 @@ class ACBrAPIService:
                         "vTotTrib": _r(tot_v_tot_trib),
                     },
                 },
-                "transp": {"modFrete": 9},
+                "transp": self._montar_transp(getattr(dados, "transporte", None)),
                 # Devolução sem pagamento associado — tPag=90 (sem pagamento).
                 # vPag=0 em tPag=90 (cStat 904 rejeita se vPag > 0).
                 "pag": {"detPag": [{"tPag": "90", "vPag": 0.0}]},

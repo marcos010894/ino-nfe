@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Body, Query
+from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import timedelta, datetime
+import io
 import json
 import uuid
 
@@ -11,6 +13,7 @@ from app.models.nota import Nota
 from app.schemas.nota import NotaResponse, ReceberVendaPayload
 from app.api.auth import get_current_user
 from app.core.security import create_access_token
+from app.services.acbr_api import ACBrAPIService
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/integracao", tags=["Integração Externa"])
@@ -46,6 +49,11 @@ class NotaIntegracaoResponse(BaseModel):
     atualizado_em: datetime
     motivo_rejeicao: Optional[str] = None
     codigo_status: Optional[str] = None
+    # Devolução (finNFe=4). Nulos em emissão normal.
+    finalidade: Optional[int] = None  # 1=normal, 2=complementar, 3=ajuste, 4=devolução
+    nota_referenciada_chave: Optional[str] = None
+    nota_referenciada_id: Optional[int] = None
+    natureza_operacao: Optional[str] = None
 
 
 class NotaIntegracaoDetalhe(NotaIntegracaoResponse):
@@ -81,9 +89,24 @@ def _extrair_rejeicao(resposta_json: Optional[Dict[str, Any]]) -> Dict[str, Opti
     return {"motivo": motivo, "codigo": str(codigo) if codigo is not None else None}
 
 
+def _urls_integracao(nota: Nota) -> Tuple[Optional[str], Optional[str]]:
+    """URLs canônicas de download via integração (X-API-Key).
+
+    Só existem quando a nota já foi transmitida (tem `acbr_id`). Retorna paths
+    relativos — o cliente resolve com o host da API que está usando (dev/prod).
+    """
+    if not nota.acbr_id:
+        return None, None
+    return (
+        f"/integracao/notas/{nota.id}/xml",
+        f"/integracao/notas/{nota.id}/pdf",
+    )
+
+
 def _nota_para_response(nota: Nota, incluir_detalhe: bool = False) -> Dict[str, Any]:
     resposta = _parse_json_safe(nota.resposta_integradora)
     rej = _extrair_rejeicao(resposta)
+    xml_url, pdf_url = _urls_integracao(nota)
     base = {
         "id": nota.id,
         "modelo": nota.modelo,
@@ -93,12 +116,16 @@ def _nota_para_response(nota: Nota, incluir_detalhe: bool = False) -> Dict[str, 
         "serie": nota.serie,
         "valor_total": nota.valor_total,
         "empresa_id": nota.empresa_id,
-        "xml_url": nota.xml_url,
-        "pdf_url": nota.pdf_url,
+        "xml_url": xml_url,
+        "pdf_url": pdf_url,
         "criado_em": nota.criado_em,
         "atualizado_em": nota.atualizado_em,
         "motivo_rejeicao": rej["motivo"],
         "codigo_status": rej["codigo"],
+        "finalidade": nota.finalidade,
+        "nota_referenciada_chave": nota.nota_referenciada_chave,
+        "nota_referenciada_id": nota.nota_referenciada_id,
+        "natureza_operacao": nota.natureza_operacao,
     }
     if incluir_detalhe:
         base["json_venda"] = _parse_json_safe(nota.json_venda)
@@ -287,6 +314,93 @@ async def obter_nota_integracao(
     if not nota:
         raise HTTPException(status_code=404, detail="Nota não encontrada.")
     return _nota_para_response(nota, incluir_detalhe=True)
+
+
+def _resolver_modelo_e_id_acbr(nota: Nota) -> Tuple[int, str]:
+    """Resolve (modelo, acbr_id) pra baixar XML/PDF na ACBr.
+
+    Mesma regra da rota interna (`app/api/notas.py`): o prefixo do `acbr_id`
+    é fonte de verdade pro modelo (nfc_ = 65, nfe_ = 55). Levanta 400 se a
+    nota ainda não tem `acbr_id` (rascunho / não transmitida).
+    """
+    if not nota.acbr_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Nota não possui id da ACBr — arquivo indisponível (nota ainda não foi transmitida).",
+        )
+    if nota.acbr_id.startswith("nfc_"):
+        return 65, nota.acbr_id
+    if nota.acbr_id.startswith("nfe_"):
+        return 55, nota.acbr_id
+    return (65 if nota.modelo == "65" else 55), nota.acbr_id
+
+
+def _carregar_nota_do_usuario(nota_id: int, usuario: Usuario, session: Session) -> Nota:
+    nota = session.exec(
+        select(Nota)
+        .where(Nota.id == nota_id)
+        .where(Nota.usuario_id == usuario.id)
+    ).first()
+    if not nota:
+        raise HTTPException(status_code=404, detail="Nota não encontrada.")
+    return nota
+
+
+@router.get("/notas/{nota_id}/xml")
+async def baixar_xml_integracao(
+    nota_id: int,
+    usuario: Usuario = Depends(get_user_by_api_key),
+    session: Session = Depends(get_session),
+):
+    """
+    Baixa o XML autorizado da nota (modelo 55 ou 65), autenticado por X-API-Key.
+
+    Retorna `application/xml` como attachment com o nome `{chave_acesso}.xml`.
+    Requer que a nota já tenha sido transmitida (status = autorizada/cancelada
+    e `acbr_id` preenchido).
+    """
+    nota = _carregar_nota_do_usuario(nota_id, usuario, session)
+    modelo, acbr_id = _resolver_modelo_e_id_acbr(nota)
+
+    acbr_service = ACBrAPIService()
+    ok, res = await acbr_service.baixar_xml(acbr_id, modelo=modelo)
+    if not ok:
+        raise HTTPException(status_code=502, detail=f"Falha ao baixar XML na ACBr: {res}")
+
+    chave = nota.chave_acesso or acbr_id
+    return StreamingResponse(
+        io.BytesIO(res),
+        media_type="application/xml",
+        headers={"Content-Disposition": f"attachment; filename={chave}.xml"},
+    )
+
+
+@router.get("/notas/{nota_id}/pdf")
+async def baixar_pdf_integracao(
+    nota_id: int,
+    usuario: Usuario = Depends(get_user_by_api_key),
+    session: Session = Depends(get_session),
+):
+    """
+    Baixa o DANFE (PDF) da nota (modelo 55 ou 65), autenticado por X-API-Key.
+
+    Retorna `application/pdf` inline com o nome `{chave_acesso}.pdf`.
+    Requer que a nota já tenha sido transmitida.
+    """
+    nota = _carregar_nota_do_usuario(nota_id, usuario, session)
+    modelo, acbr_id = _resolver_modelo_e_id_acbr(nota)
+
+    acbr_service = ACBrAPIService()
+    ok, res = await acbr_service.baixar_pdf(acbr_id, modelo=modelo)
+    if not ok:
+        raise HTTPException(status_code=502, detail=f"Falha ao baixar DANFE na ACBr: {res}")
+
+    chave = nota.chave_acesso or acbr_id
+    return StreamingResponse(
+        io.BytesIO(res),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={chave}.pdf"},
+    )
 
 
 # ---------------------------------------------------------------------------
