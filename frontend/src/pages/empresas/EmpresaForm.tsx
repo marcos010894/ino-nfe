@@ -28,7 +28,10 @@ export default function EmpresaForm() {
     csc_id: '',
     csc_token: '',
     serie_nfe: 1,
-    serie_nfce: 1
+    serie_nfce: 1,
+    // Migração de ERP: número inicial da série. Vazio = começa em 1.
+    proximo_nnf_inicial_nfe: '' as string | number | null,
+    proximo_nnf_inicial_nfce: '' as string | number | null,
   });
 
   const [certFile, setCertFile] = useState<File | null>(null);
@@ -171,6 +174,9 @@ export default function EmpresaForm() {
         // inputs type=number vêm como string do DOM — coagir pra int aqui.
         serie_nfe: Number(formData.serie_nfe) || 1,
         serie_nfce: Number(formData.serie_nfce) || 1,
+        // Nullable: string vazia vira null (não enviar 0).
+        proximo_nnf_inicial_nfe: formData.proximo_nnf_inicial_nfe ? Number(formData.proximo_nnf_inicial_nfe) : null,
+        proximo_nnf_inicial_nfce: formData.proximo_nnf_inicial_nfce ? Number(formData.proximo_nnf_inicial_nfce) : null,
       };
 
       if (isEditing) {
@@ -446,6 +452,37 @@ export default function EmpresaForm() {
               <div className="text-[11px] text-muted -mt-2">
                 Trocar a série reinicia a numeração (nNF) do zero nessa série. Útil para
                 abandonar séries com gaps na sequência sem precisar inutilizar cada número.
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-bold text-muted uppercase">Próximo nº NF-e inicial</label>
+                  <input
+                    name="proximo_nnf_inicial_nfe"
+                    type="number"
+                    min={1}
+                    value={formData.proximo_nnf_inicial_nfe ?? ''}
+                    onChange={handleChange}
+                    placeholder="Vazio = começa em 1"
+                    className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-xs font-bold text-muted uppercase">Próximo nº NFC-e inicial</label>
+                  <input
+                    name="proximo_nnf_inicial_nfce"
+                    type="number"
+                    min={1}
+                    value={formData.proximo_nnf_inicial_nfce ?? ''}
+                    onChange={handleChange}
+                    placeholder="Vazio = começa em 1"
+                    className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                  />
+                </div>
+              </div>
+              <div className="text-[11px] text-muted -mt-2">
+                Preencha só se a empresa já emitiu antes (migração de outro ERP). O sistema
+                usa esse número na 1ª nota e depois segue MAX+1 normalmente.
               </div>
             </div>
 

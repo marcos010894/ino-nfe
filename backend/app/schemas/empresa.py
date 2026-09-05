@@ -22,6 +22,9 @@ class EmpresaBase(BaseModel):
     # Série ativa por modelo (cliente pode trocar via UI para reiniciar numeração)
     serie_nfe: int = 1
     serie_nfce: int = 1
+    # Próximo nNF inicial (migração de ERP). NULL = começa em 1.
+    proximo_nnf_inicial_nfe: Optional[int] = None
+    proximo_nnf_inicial_nfce: Optional[int] = None
 
 class EmpresaCreate(EmpresaBase):
     pass

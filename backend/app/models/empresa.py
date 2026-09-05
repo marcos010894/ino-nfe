@@ -35,6 +35,12 @@ class Empresa(SQLModel, table=True):
     # modelo, série) — ao trocar de série, o contador reinicia naturalmente.
     serie_nfe: int = Field(default=1)   # modelo 55
     serie_nfce: int = Field(default=1)  # modelo 65
+
+    # Número inicial da série para clientes que migraram de outro ERP e já têm
+    # numeração autorizada na SEFAZ. Aplicado só quando ainda não há nota emitida
+    # pela série ativa (senão vira MAX+1 normal). NULL = começa em 1.
+    proximo_nnf_inicial_nfe: Optional[int] = Field(default=None)
+    proximo_nnf_inicial_nfce: Optional[int] = Field(default=None)
     
     # Certificado Digital A1
     certificado_base64: Optional[str] = None

@@ -14,9 +14,10 @@ from app.models.nota import Nota
 from app.models.usuario import Usuario
 from app.schemas.nota import (
     NotaCreate, NotaResponse, NotaCancelar, InutilizacaoRequest,
-    DevolucaoCreate, DevolucaoPreviewResponse,
+    DevolucaoCreate, DevolucaoPreviewResponse, NotaReenviar,
 )
 from app.api.auth import get_current_user
+from app.api.integracao import _eh_denegacao, _eh_timeout_acbr
 from app.services.acbr_api import ACBrAPIService
 from app.services.xml_parser import parse_nfe_xml
 from fastapi import UploadFile, File
@@ -93,7 +94,15 @@ async def criar_e_transmitir_nota(
         )
         .order_by(Nota.numero.desc())
     ).first()
-    proximo_numero = (ultimo_numero or 0) + 1
+    # Série virgem no InnoFiscal: usa `proximo_nnf_inicial_*` da empresa (só relevante
+    # em migração de ERP — sem isso começaria em 1 e a SEFAZ rejeitaria com cStat 539
+    # duplicidade se o CNPJ já tiver emitido antes por outro sistema).
+    if ultimo_numero:
+        proximo_numero = ultimo_numero + 1
+    else:
+        inicial = (empresa.proximo_nnf_inicial_nfe if modelo_int == 55
+                   else empresa.proximo_nnf_inicial_nfce)
+        proximo_numero = inicial or 1
 
     # 5. Instanciar o serviço ACBr e montar o payload
     acbr_service = ACBrAPIService()
@@ -172,9 +181,13 @@ async def criar_e_transmitir_nota(
         # Se for NF-e processando, guardamos o id da ACBr + chave temporária se vier ou a referência
         nova_nota.acbr_id = resposta.get("id")
         nova_nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso") or payload.get("referencia")
-        nova_nota.numero = resposta.get("numero") or resposta.get("numeroNota")
-        nova_nota.serie = resposta.get("serie") or 1
-        
+        nova_nota.numero = resposta.get("numero") or resposta.get("numeroNota") or proximo_numero
+        nova_nota.serie = resposta.get("serie") or SERIE_PADRAO
+        # Timeout/erro comm ACBr: status real incerto. Marca pendente_consulta pra
+        # travar a fila até uma consulta explícita ao SEFAZ resolver o veredito.
+        if _eh_timeout_acbr(resposta):
+            nova_nota.status = "pendente_consulta"
+
         # PDFs/XMLs proxies temporários
         nova_nota.pdf_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nova_nota.id}/pdf"
         nova_nota.xml_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nova_nota.id}/xml"
@@ -195,17 +208,220 @@ async def criar_e_transmitir_nota(
         # quando lê só o nível raiz. Consumers podem ler `motivo_status`/`codigo_status`
         # direto sem descer no `autorizacao`.
         resposta = {**resposta, "motivo_status": motivo, "codigo_status": cstat}
+        # Denegação (110/301/302): SEFAZ consumiu o nNF mas trava reenvio.
+        # Status próprio pra a fila seguir (nNF+1) sem oferecer botão de reenviar.
+        if _eh_denegacao(cstat):
+            nova_nota.status = "denegada"
         nova_nota.resposta_integradora = json.dumps(resposta)
         # id/chave também vêm na rejeição — guardar para diagnóstico
         nova_nota.acbr_id = resposta.get("id")
         nova_nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso")
-        print(f"Nota Rejeitada ID {nova_nota.id}: cStat {cstat} — {motivo}")
+        print(f"Nota {nova_nota.status.title()} ID {nova_nota.id}: cStat {cstat} — {motivo}")
 
     session.add(nova_nota)
     session.commit()
     session.refresh(nova_nota)
 
     return nova_nota
+
+
+# ------------------------------------------------------------------
+# Reenvio de nota REJEITADA — reusa o mesmo nNF/serie
+# ------------------------------------------------------------------
+
+def _aplicar_destinatario_reenvio(venda_data: dict, destinatario) -> dict:
+    """Sobrescreve os campos de cliente/endereço do json_venda com os do body.
+
+    Só atualiza os campos que vieram preenchidos no body — o resto do json_venda
+    permanece intacto. Campos vazios ("") são tratados como "não enviado" e
+    ignorados, pra não zerar dado válido do original.
+    """
+    if destinatario is None:
+        return venda_data
+
+    dest_dict = destinatario.model_dump(exclude_none=True)
+    # Descartar strings vazias — pydantic aceita "" como valor válido, mas aqui
+    # semanticamente significa "usuário não preencheu".
+    dest_dict = {k: v for k, v in dest_dict.items() if not (isinstance(v, str) and v.strip() == "")}
+    if not dest_dict:
+        return venda_data
+
+    cliente = dict(venda_data.get("cliente") or {})
+    endereco = dict(cliente.get("endereco") or {})
+
+    # Campos no nível do cliente
+    for k in ("nome", "cpf", "cnpj", "email", "telefone"):
+        if k in dest_dict:
+            cliente[k] = dest_dict[k]
+
+    # Campos no nível do endereço
+    endereco_keys = ("logradouro", "numero", "complemento", "bairro", "cidade",
+                      "uf", "cep", "codigo_municipio")
+    for k in endereco_keys:
+        if k in dest_dict:
+            endereco[k] = dest_dict[k]
+
+    if endereco:
+        cliente["endereco"] = endereco
+    venda_data["cliente"] = cliente
+    return venda_data
+
+
+@router.post("/{nota_id}/reenviar", response_model=NotaResponse)
+async def reenviar_nota_rejeitada(
+    empresa_id: int,
+    nota_id: int,
+    body: Optional[NotaReenviar] = None,
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Reenvia uma nota REJEITADA reusando o mesmo nNF/serie.
+
+    Objetivo: evitar furo na sequência numérica quando a SEFAZ rejeita a nota.
+    O número fica "reservado" pra essa nota até virar autorizada, cancelada ou
+    ser inutilizada — nunca é consumido por outra venda.
+
+    Fluxo:
+    - Só aceita nota com status="rejeitada".
+    - Se `body.destinatario` vier preenchido, sobrescreve os campos correspondentes
+      no `json_venda` salvo antes de remontar o payload.
+    - Reusa `numero` e `serie` da nota original (não pega MAX+1).
+    - Substitui o registro existente (não cria nota nova).
+    """
+    empresa = _verificar_empresa(empresa_id, session, current_user)
+
+    # 1. Buscar a nota e validar
+    nota = session.get(Nota, nota_id)
+    if not nota or nota.empresa_id != empresa_id:
+        raise HTTPException(status_code=404, detail="Nota não encontrada.")
+    if nota.status != "rejeitada":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Só é possível reenviar notas com status='rejeitada'. Status atual: '{nota.status}'."
+        )
+    if nota.numero is None:
+        # Não deveria acontecer — o fluxo de criação persiste numero antes de transmitir.
+        raise HTTPException(
+            status_code=400,
+            detail="Nota rejeitada sem número reservado. Impossível reenviar sem gerar furo."
+        )
+
+    # 2. Regra fiscal padrão (mesma lógica do POST /)
+    regra = session.exec(
+        select(RegraFiscal).where(RegraFiscal.empresa_id == empresa_id, RegraFiscal.padrao == True)
+    ).first()
+    if not regra:
+        regra = session.exec(
+            select(RegraFiscal).where(RegraFiscal.empresa_id == empresa_id)
+        ).first()
+    if not regra:
+        raise HTTPException(status_code=400, detail="Nenhuma regra fiscal cadastrada para esta empresa.")
+
+    # 3. Parsear json_venda salvo + aplicar overrides do destinatário
+    try:
+        venda_data = json.loads(nota.json_venda or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="json_venda salvo é inválido — impossível remontar payload.")
+
+    if not venda_data.get("itens"):
+        raise HTTPException(status_code=400, detail="json_venda salvo não tem itens.")
+
+    venda_data = _aplicar_destinatario_reenvio(venda_data, body.destinatario if body else None)
+
+    # 4. Recalcular valor_total (destinatário mudou, mas itens podem ter permanecido)
+    itens = venda_data.get("itens", [])
+    v_prod = sum(float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0)) for item in itens)
+    v_desc = float(venda_data.get("desconto", 0.0))
+    valor_total = round(v_prod - v_desc, 2)
+
+    # 5. Remontar payload — REUSA numero/serie da nota original
+    modelo_int = int(nota.modelo) if nota.modelo else 65
+    acbr_service = ACBrAPIService()
+    try:
+        payload = acbr_service.montar_payload_nfce(
+            empresa, regra, venda_data,
+            modelo=modelo_int, numero=nota.numero, serie=nota.serie or 1,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao gerar payload fiscal: {str(e)}")
+
+    # 6. Atualizar o registro da nota (não cria nova)
+    nota.status = "processando"
+    nota.valor_total = valor_total
+    nota.json_venda = json.dumps(venda_data)
+    nota.payload_enviado = json.dumps(payload)
+    nota.atualizado_em = datetime.utcnow()
+    # numero e serie ficam intactos — é o ponto do reenvio.
+    session.add(nota)
+    session.commit()
+    session.refresh(nota)
+
+    # 7. Transmitir
+    if modelo_int == 55:
+        status, resposta = await acbr_service.transmitir_nfe(payload)
+    else:
+        status, resposta = await acbr_service.transmitir_nfce(payload)
+
+    # 8. Tratar retorno (mesmo shape do POST /)
+    nota.status = status
+    nota.resposta_integradora = json.dumps(resposta)
+    nota.atualizado_em = datetime.utcnow()
+
+    if status == "autorizada":
+        nota.acbr_id = resposta.get("id")
+        nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso")
+        # numero/serie autoritativos da ACBr — mas devem casar com os que reservamos
+        acbr_numero = resposta.get("numero") or resposta.get("numeroNota")
+        if acbr_numero is not None:
+            nota.numero = acbr_numero
+        acbr_serie = resposta.get("serie")
+        if acbr_serie is not None:
+            nota.serie = acbr_serie
+        if nota.acbr_id:
+            if nota.acbr_id.startswith("nfc_"):
+                nota.modelo = "65"
+            elif nota.acbr_id.startswith("nfe_"):
+                nota.modelo = "55"
+        nota.pdf_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nota.id}/pdf"
+        nota.xml_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nota.id}/xml"
+    elif status == "processando":
+        nota.acbr_id = resposta.get("id")
+        nota.chave_acesso = (
+            resposta.get("chave") or resposta.get("chaveAcesso") or payload.get("referencia")
+        )
+        # Timeout/erro comm ACBr: SEFAZ pode ter recebido esse reenvio ou não.
+        # Marca pendente_consulta pra ativar o fluxo de consulta por chave.
+        if _eh_timeout_acbr(resposta):
+            nota.status = "pendente_consulta"
+        nota.pdf_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nota.id}/pdf"
+        nota.xml_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nota.id}/xml"
+    else:
+        # Rejeitada de novo — achata motivo/cstat no topo, mantém numero/serie.
+        aut = resposta.get("autorizacao") or {}
+        err = resposta.get("error") or {}
+        motivo = (
+            aut.get("motivo_status")
+            or resposta.get("motivo_status")
+            or err.get("message")
+            or resposta.get("motivo")
+            or resposta.get("mensagem")
+            or (resposta.get("erro") if isinstance(resposta.get("erro"), str) else None)
+            or "Rejeição desconhecida"
+        )
+        cstat = aut.get("codigo_status") or resposta.get("codigo_status") or err.get("code")
+        resposta = {**resposta, "motivo_status": motivo, "codigo_status": cstat}
+        # Denegação (110/301/302) no reenvio: nNF foi consumido nessa
+        # tentativa, não dá pra reenviar de novo. Marca denegada.
+        if _eh_denegacao(cstat):
+            nota.status = "denegada"
+        nota.resposta_integradora = json.dumps(resposta)
+        nota.acbr_id = resposta.get("id") or nota.acbr_id
+        print(f"Reenvio da Nota ID {nota.id} {nota.status}: cStat {cstat} — {motivo}")
+
+    session.add(nota)
+    session.commit()
+    session.refresh(nota)
+    return nota
 
 
 # ------------------------------------------------------------------
@@ -300,7 +516,8 @@ async def emitir_devolucao(
         )
         .order_by(Nota.numero.desc())
     ).first()
-    proximo_numero = (ultimo_numero or 0) + 1
+    # Devolução é sempre mod 55 — reusa proximo_nnf_inicial_nfe quando série virgem.
+    proximo_numero = (ultimo_numero + 1) if ultimo_numero else (empresa.proximo_nnf_inicial_nfe or 1)
 
     # Montar payload
     acbr_service = ACBrAPIService()
@@ -361,6 +578,9 @@ async def emitir_devolucao(
     elif status == "processando":
         nova_nota.acbr_id = resposta.get("id")
         nova_nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso") or payload.get("referencia")
+        # Timeout na devolução: mesmo tratamento — pendente_consulta trava a fila.
+        if _eh_timeout_acbr(resposta):
+            nova_nota.status = "pendente_consulta"
         nova_nota.pdf_url = f"/empresas/{empresa_id}/notas/{nova_nota.id}/pdf"
         nova_nota.xml_url = f"/empresas/{empresa_id}/notas/{nova_nota.id}/xml"
     else:
@@ -377,6 +597,9 @@ async def emitir_devolucao(
         )
         cstat = aut.get("codigo_status") or resposta.get("codigo_status") or err.get("code")
         resposta = {**resposta, "motivo_status": motivo, "codigo_status": cstat}
+        # Denegação em devolução: nNF de devolução consumido, marca denegada.
+        if _eh_denegacao(cstat):
+            nova_nota.status = "denegada"
         nova_nota.resposta_integradora = json.dumps(resposta)
         nova_nota.acbr_id = resposta.get("id")
         nova_nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso")
@@ -437,6 +660,76 @@ async def cancelar_nota(
         )
         prefixo = f"cStat {cstat}: " if cstat else ""
         raise HTTPException(status_code=400, detail=f"Falha ao cancelar nota na SEFAZ: {prefixo}{motivo}")
+
+
+@router.post("/{nota_id}/inutilizar", response_model=NotaResponse)
+async def inutilizar_nota_individual(
+    empresa_id: int,
+    nota_id: int,
+    cancel_in: NotaCancelar,
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Inutiliza o nNF de UMA nota rejeitada/pendente_consulta — destrava a fila.
+
+    ÚLTIMO RECURSO. A preferência é sempre reenviar corrigido (`/reenviar` reusa
+    mesmo nNF). Só use quando o operador DESISTIR da venda — inutilização gera
+    lastro fiscal permanente na SEFAZ.
+
+    Gêmea JWT do `POST /integracao/inutilizar/{id}` (X-API-Key) — mesma lógica,
+    só muda a autenticação. Existe pra frontend não precisar expor o token de
+    integração no browser.
+    """
+    empresa = _verificar_empresa(empresa_id, session, current_user)
+
+    nota = session.get(Nota, nota_id)
+    if not nota or nota.empresa_id != empresa_id:
+        raise HTTPException(status_code=404, detail="Nota fiscal não encontrada.")
+    if nota.status not in ("rejeitada", "pendente_consulta"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Só notas 'rejeitada' ou 'pendente_consulta' podem ser inutilizadas. Status atual: '{nota.status}'.",
+        )
+    if nota.numero is None:
+        raise HTTPException(status_code=400, detail="Nota sem número reservado — nada a inutilizar.")
+    if len(cancel_in.justificativa) < 15:
+        raise HTTPException(status_code=400, detail="Justificativa deve ter no mínimo 15 caracteres.")
+
+    modelo_int = 55 if nota.modelo == "55" else 65
+    ano = (nota.criado_em or datetime.utcnow()).year
+
+    acbr = ACBrAPIService()
+    ok, resposta = await acbr.inutilizar_faixa(
+        cnpj=empresa.cnpj,
+        ano=ano,
+        serie=nota.serie or 1,
+        numero_inicial=nota.numero,
+        numero_final=nota.numero,
+        justificativa=cancel_in.justificativa,
+        modelo=modelo_int,
+    )
+
+    if not ok:
+        aut = resposta.get("autorizacao") or {}
+        err = resposta.get("error") or {}
+        motivo = (
+            aut.get("motivo_status")
+            or resposta.get("motivo_status")
+            or err.get("message")
+            or resposta.get("erro")
+            or "Rejeição desconhecida"
+        )
+        cstat = aut.get("codigo_status") or resposta.get("codigo_status") or err.get("code")
+        prefixo = f"cStat {cstat}: " if cstat else ""
+        raise HTTPException(status_code=400, detail=f"SEFAZ recusou inutilização: {prefixo}{motivo}")
+
+    nota.status = "inutilizada"
+    nota.resposta_integradora = json.dumps(resposta)
+    nota.atualizado_em = datetime.utcnow()
+    session.add(nota)
+    session.commit()
+    session.refresh(nota)
+    return nota
 
 
 @router.post("/inutilizacoes")
@@ -671,7 +964,16 @@ async def reprocessar_nota(
         nota.serie = resposta.get("serie")
         nota.pdf_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nota.id}/pdf"
         nota.xml_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nota.id}/xml"
-        
+    else:
+        # Denegação (110/301/302): nNF consumido, sem reenvio possível.
+        aut = resposta.get("autorizacao") or {}
+        cstat = aut.get("codigo_status") or resposta.get("codigo_status") or (resposta.get("error") or {}).get("code")
+        if _eh_denegacao(cstat):
+            nota.status = "denegada"
+        elif status == "processando" and _eh_timeout_acbr(resposta):
+            # Timeout na retransmissão: destino incerto, marca pendente_consulta.
+            nota.status = "pendente_consulta"
+
     session.add(nota)
     session.commit()
     session.refresh(nota)
@@ -858,8 +1160,10 @@ async def consultar_status_nota(
     if not nota or nota.empresa_id != empresa_id:
         raise HTTPException(status_code=404, detail="Nota fiscal não encontrada.")
         
-    if nota.status != "processando":
-        return nota # Já concluída
+    # Aceita processando (fila async normal) e pendente_consulta (timeout no envio,
+    # destino incerto — SEFAZ pode ter recebido ou não). Terminais retornam como estão.
+    if nota.status not in ("processando", "pendente_consulta"):
+        return nota
 
     # 1. Localizar o identificador que a ACBr aceita no path.
     # GET /nfe/{id} exige o id interno da ACBr (`nfe_xxx`), NÃO a chave nem a referência
@@ -882,20 +1186,29 @@ async def consultar_status_nota(
     acbr_service = ACBrAPIService()
     status, resposta = await acbr_service.consultar_status_nfe(identificador)
     
-    # 3. Atualizar nota no banco
-    nota.status = status
+    # 3. Atualizar nota no banco. Aplica denegação (cStat 110/301/302) e mantém
+    # pendente_consulta se SEFAZ ainda não devolveu status definitivo.
+    aut = resposta.get("autorizacao") or {}
+    cstat = aut.get("codigo_status") or resposta.get("codigo_status")
+
+    if _eh_denegacao(cstat):
+        nota.status = "denegada"
+    elif status in ("autorizada", "rejeitada"):
+        nota.status = status
+    # senão: SEFAZ não deu veredito ainda — preserva pendente_consulta/processando.
+
     nota.resposta_integradora = json.dumps(resposta)
     nota.atualizado_em = datetime.utcnow()
-    
-    if status == "autorizada":
+
+    if nota.status == "autorizada":
         nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso") or nota.chave_acesso
         nota.numero = resposta.get("numero") or resposta.get("numeroNota") or nota.numero
         nota.serie = resposta.get("serie") or nota.serie or 1
-        
+
     session.add(nota)
     session.commit()
     session.refresh(nota)
-    
+
     return nota
 
 
