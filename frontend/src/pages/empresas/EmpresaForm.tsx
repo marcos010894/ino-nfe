@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useParams, Link } from 'react-router-dom';
-import { ArrowLeft, Save, UploadCloud, Loader2, Zap } from 'lucide-react';
+import { ArrowLeft, Save, UploadCloud, Loader2, Zap, RefreshCw, Hash } from 'lucide-react';
 
 import api from '../../lib/api';
 import { formatCNPJ, formatCEP, unformat } from '../../lib/formatters';
@@ -36,10 +36,34 @@ export default function EmpresaForm() {
 
   const [certFile, setCertFile] = useState<File | null>(null);
   const [certSenha, setCertSenha] = useState('');
-  
+
   const [loading, setLoading] = useState(isEditing);
   const [salvando, setSalvando] = useState(false);
   const [erro, setErro] = useState('');
+
+  // Preview do próximo nNF (calculado live pelo backend).
+  const [proximoNfe, setProximoNfe] = useState<{ numero: number; serie: number; fonte: string } | null>(null);
+  const [proximoNfce, setProximoNfce] = useState<{ numero: number; serie: number; fonte: string } | null>(null);
+  const [carregandoProximo, setCarregandoProximo] = useState(false);
+
+  async function recarregarProximos() {
+    if (!isEditing || !id) return;
+    setCarregandoProximo(true);
+    try {
+      const [r55, r65] = await Promise.all([
+        api.get(`/empresas/${id}/notas/proximo-numero`, { params: { modelo: 55 } }),
+        api.get(`/empresas/${id}/notas/proximo-numero`, { params: { modelo: 65 } }),
+      ]);
+      setProximoNfe({ numero: r55.data.proximo_numero, serie: r55.data.serie, fonte: r55.data.fonte });
+      setProximoNfce({ numero: r65.data.proximo_numero, serie: r65.data.serie, fonte: r65.data.fonte });
+    } catch {
+      // silencioso — se falhar é só mostrar "—"
+    } finally {
+      setCarregandoProximo(false);
+    }
+  }
+
+  useEffect(() => { recarregarProximos(); }, [isEditing, id]);
 
   // Inutilização de faixa de numeração (Etapa G do MVP).
   // Só faz sentido em modo edição — precisa da empresa já criada.
@@ -454,35 +478,70 @@ export default function EmpresaForm() {
                 abandonar séries com gaps na sequência sem precisar inutilizar cada número.
               </div>
 
+              {/* Numeração ativa — mostra qual nº será o próximo, live do backend */}
+              {isEditing && (
+                <div className="bg-white border border-line rounded-lg p-3 flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs font-bold text-ink flex items-center gap-1.5">
+                      <Hash size={14} className="text-i9" /> Numeração ativa
+                    </div>
+                    <button type="button" onClick={recarregarProximos} disabled={carregandoProximo}
+                            className="text-[11px] text-muted hover:text-ink flex items-center gap-1 disabled:opacity-40">
+                      <RefreshCw size={11} className={carregandoProximo ? 'animate-spin' : ''} /> Atualizar
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className="bg-bg rounded px-3 py-2">
+                      <div className="text-[10px] text-muted uppercase font-bold">Próxima NF-e</div>
+                      <div className="font-mono font-extrabold text-lg">
+                        {proximoNfe ? `nº ${proximoNfe.numero} · s${proximoNfe.serie}` : '—'}
+                      </div>
+                      {proximoNfe?.fonte === 'forcado' && (
+                        <div className="text-[10px] text-i9 font-semibold">forçado no cadastro</div>
+                      )}
+                    </div>
+                    <div className="bg-bg rounded px-3 py-2">
+                      <div className="text-[10px] text-muted uppercase font-bold">Próxima NFC-e</div>
+                      <div className="font-mono font-extrabold text-lg">
+                        {proximoNfce ? `nº ${proximoNfce.numero} · s${proximoNfce.serie}` : '—'}
+                      </div>
+                      {proximoNfce?.fonte === 'forcado' && (
+                        <div className="text-[10px] text-i9 font-semibold">forçado no cadastro</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-3">
                 <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold text-muted uppercase">Próximo nº NF-e inicial</label>
+                  <label className="text-xs font-bold text-muted uppercase">Forçar próximo nº NF-e</label>
                   <input
                     name="proximo_nnf_inicial_nfe"
                     type="number"
                     min={1}
                     value={formData.proximo_nnf_inicial_nfe ?? ''}
                     onChange={handleChange}
-                    placeholder="Vazio = começa em 1"
+                    placeholder="Vazio = MAX+1 normal"
                     className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
                   />
                 </div>
                 <div className="flex flex-col gap-1.5">
-                  <label className="text-xs font-bold text-muted uppercase">Próximo nº NFC-e inicial</label>
+                  <label className="text-xs font-bold text-muted uppercase">Forçar próximo nº NFC-e</label>
                   <input
                     name="proximo_nnf_inicial_nfce"
                     type="number"
                     min={1}
                     value={formData.proximo_nnf_inicial_nfce ?? ''}
                     onChange={handleChange}
-                    placeholder="Vazio = começa em 1"
+                    placeholder="Vazio = MAX+1 normal"
                     className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
                   />
                 </div>
               </div>
               <div className="text-[11px] text-muted -mt-2">
-                Preencha só se a empresa já emitiu antes (migração de outro ERP). O sistema
-                usa esse número na 1ª nota e depois segue MAX+1 normalmente.
+                Se preencher, o sistema usa esse número <b>uma vez</b> (na próxima emissão) e
+                depois volta ao sequencial MAX+1. Útil pra migração de ERP ou correção pontual.
               </div>
             </div>
 

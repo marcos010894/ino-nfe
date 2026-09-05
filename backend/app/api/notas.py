@@ -65,20 +65,24 @@ def obter_proximo_numero(
         .order_by(Nota.numero.desc())
     ).first()
 
-    if ultimo_numero:
+    # Mesma prioridade do POST: inicial_forcado > MAX+1 > 1.
+    inicial_forcado = empresa.proximo_nnf_inicial_nfe if modelo == 55 else empresa.proximo_nnf_inicial_nfce
+    if inicial_forcado:
+        proximo = inicial_forcado
+        fonte = "forcado"  # cadastro tem proximo_nnf_inicial_* setado
+    elif ultimo_numero:
         proximo = ultimo_numero + 1
         fonte = "sequencial"
     else:
-        inicial = empresa.proximo_nnf_inicial_nfe if modelo == 55 else empresa.proximo_nnf_inicial_nfce
-        proximo = inicial or 1
-        fonte = "migracao" if inicial else "inicio_serie"
+        proximo = 1
+        fonte = "inicio_serie"
 
     return {
         "modelo": modelo,
         "serie": serie,
         "proximo_numero": proximo,
         "ultimo_emitido": ultimo_numero,
-        "fonte": fonte,  # "sequencial" | "migracao" | "inicio_serie"
+        "fonte": fonte,  # "forcado" | "sequencial" | "inicio_serie"
     }
 
 @router.post("/", response_model=NotaResponse)
@@ -140,19 +144,31 @@ async def criar_e_transmitir_nota(
         .order_by(Nota.numero.desc())
     ).first()
     # Prioridade:
-    # 1) numero_override (operador escolheu na tela de preview antes de enviar SEFAZ)
-    # 2) ultimo_numero + 1 (MAX+1 normal)
-    # 3) empresa.proximo_nnf_inicial_* (migração de ERP; série virgem no InnoFiscal)
-    #    Sem isso começaria em 1 e a SEFAZ rejeitaria cStat 539 (duplicidade) se o
-    #    CNPJ já tiver emitido antes por outro sistema.
+    # 1) numero_override (operador escolheu no modal de preview)
+    # 2) empresa.proximo_nnf_inicial_* — "força uma vez": se setado, usa e ZERA
+    #    depois. Serve pra migração de ERP e pra correção pontual pelo cadastro.
+    # 3) ultimo_numero + 1 (MAX+1 sequencial)
+    # 4) 1 (empresa sem histórico e sem inicial forçado)
+    inicial_forcado = (empresa.proximo_nnf_inicial_nfe if modelo_int == 55
+                       else empresa.proximo_nnf_inicial_nfce)
+    consumiu_inicial = False
     if nota_in.numero_override:
         proximo_numero = nota_in.numero_override
+    elif inicial_forcado:
+        proximo_numero = inicial_forcado
+        consumiu_inicial = True
     elif ultimo_numero:
         proximo_numero = ultimo_numero + 1
     else:
-        inicial = (empresa.proximo_nnf_inicial_nfe if modelo_int == 55
-                   else empresa.proximo_nnf_inicial_nfce)
-        proximo_numero = inicial or 1
+        proximo_numero = 1
+
+    # Se consumiu o "força uma vez", zera pra próxima emissão cair no MAX+1.
+    if consumiu_inicial:
+        if modelo_int == 55:
+            empresa.proximo_nnf_inicial_nfe = None
+        else:
+            empresa.proximo_nnf_inicial_nfce = None
+        session.add(empresa)
 
     # 5. Instanciar o serviço ACBr e montar o payload
     acbr_service = ACBrAPIService()
@@ -566,8 +582,20 @@ async def emitir_devolucao(
         )
         .order_by(Nota.numero.desc())
     ).first()
-    # Devolução é sempre mod 55 — reusa proximo_nnf_inicial_nfe quando série virgem.
-    proximo_numero = (ultimo_numero + 1) if ultimo_numero else (empresa.proximo_nnf_inicial_nfe or 1)
+    # Devolução é sempre mod 55 — segue mesma prioridade do POST /notas/ (inicial
+    # forçado > MAX+1 > 1) e consome o inicial se usar.
+    inicial_forcado_dev = empresa.proximo_nnf_inicial_nfe
+    consumiu_inicial_dev = False
+    if inicial_forcado_dev:
+        proximo_numero = inicial_forcado_dev
+        consumiu_inicial_dev = True
+    elif ultimo_numero:
+        proximo_numero = ultimo_numero + 1
+    else:
+        proximo_numero = 1
+    if consumiu_inicial_dev:
+        empresa.proximo_nnf_inicial_nfe = None
+        session.add(empresa)
 
     # Montar payload
     acbr_service = ACBrAPIService()
