@@ -530,7 +530,10 @@ class ACBrAPIService:
             v_un = float(item.get("valor_unitario", 0.0))
             v_item_prod = _r(qtd * v_un)
 
-            ncm = item.get("ncm", regra.ncm_padrao)
+            # `dict.get(k, default)` só usa default se a chave sumir — quando o
+            # InnoSystem manda `"ncm": null` explicito, get() retorna None. Usar
+            # `or` cobre None, "" e ausencia da chave.
+            ncm = item.get("ncm") or regra.ncm_padrao or ""
             ncm = "".join(filter(str.isdigit, ncm))[:8]
             cfop = "".join(filter(str.isdigit, regra.cfop))[:4]
 
