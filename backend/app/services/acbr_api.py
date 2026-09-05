@@ -744,6 +744,8 @@ class ACBrAPIService:
 
         v_nf = _r(v_prod - v_desc + tot_v_st + tot_v_ipi + tot_v_ii - tot_v_icms_deson)
 
+        agora_iso = datetime.now(timezone(timedelta(hours=-3))).isoformat(timespec="seconds")
+
         payload: Dict[str, Any] = {
             "ambiente": "homologacao" if self.env != "producao" else "producao",
             "referencia": str(uuid.uuid4()),
@@ -759,7 +761,7 @@ class ACBrAPIService:
                     # Fallback random só existe para scripts legados de teste em hom —
                     # em produção o caller SEMPRE passa `numero` calculado por MAX+1.
                     "nNF": numero if numero is not None else random.randint(1, 999999),
-                    "dhEmi": datetime.now(timezone(timedelta(hours=-3))).isoformat(timespec="seconds"),
+                    "dhEmi": agora_iso,
                     "tpNF": 1,
                     "idDest": 1,
                     "cMunFG": cod_mun_uf,
@@ -827,6 +829,30 @@ class ACBrAPIService:
 
         if dest:
             payload["infNFe"]["dest"] = dest
+
+        # NF-e mod 55 tpNF=1 (saída): informar dhSaiEnt. Sem isso o DANFE sai com
+        # "Data/Hora da Saída" em branco — a Receita/fisco cobra o campo quando
+        # há movimentação efetiva de mercadoria.
+        if modelo == 55:
+            payload["infNFe"]["ide"]["dhSaiEnt"] = agora_iso
+
+        # infAdic.infCpl:
+        # - Simples Nacional (CRT=1): LC 123/2006 Art. 26 §5-A exige texto padrão
+        #   sobre não gerar direito a crédito. SEFAZ não rejeita, mas fisco pode
+        #   autuar e o DANFE fica com "INFORMAÇÕES COMPLEMENTARES" em branco.
+        # - Se o InnoSystem enviou `numero_pedido_externo`, anexa como rastreio.
+        partes_cpl = []
+        if crt == 1:
+            partes_cpl.append(
+                "DOCUMENTO EMITIDO POR ME OU EPP OPTANTE PELO SIMPLES NACIONAL. "
+                "NAO GERA DIREITO A CREDITO FISCAL DE ICMS, IPI E ISS. "
+                "(LC 123/2006 ART. 26 5-A)"
+            )
+        pedido_ext = (venda.get("numero_pedido_externo") or "").strip()
+        if pedido_ext:
+            partes_cpl.append(f"PEDIDO: {pedido_ext}")
+        if partes_cpl:
+            payload["infNFe"]["infAdic"] = {"infCpl": " ".join(partes_cpl)[:5000]}
 
         return payload
 
