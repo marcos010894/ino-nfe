@@ -1312,6 +1312,9 @@ class ACBrAPIService:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         payload = {
             "cnpj": "".join(filter(str.isdigit, cnpj)),
+            # ACBr exige `ambiente` no payload de inutilização (não infere da config
+            # per-tenant como faz em transmissão). Sem isso: ValidationFailed.
+            "ambiente": "homologacao" if self.env != "producao" else "producao",
             "ano": ano,
             "serie": serie,
             "numero_inicial": numero_inicial,
