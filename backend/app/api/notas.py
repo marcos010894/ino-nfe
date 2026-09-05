@@ -36,6 +36,51 @@ def listar_notas(empresa_id: int, session: Session = Depends(get_session), curre
     notas = session.exec(select(Nota).where(Nota.empresa_id == empresa_id).order_by(Nota.criado_em.desc())).all()
     return notas
 
+
+@router.get("/proximo-numero")
+def obter_proximo_numero(
+    empresa_id: int,
+    modelo: int = Query(..., ge=55, le=65),
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Retorna o próximo nNF sugerido + série ativa (pra preview antes de emitir).
+
+    Mesma lógica de `criar_e_transmitir_nota` sem transmitir. O operador pode
+    aceitar o sugerido OU sobrescrever via `numero_override` no POST.
+    """
+    empresa = _verificar_empresa(empresa_id, session, current_user)
+    if modelo not in (55, 65):
+        raise HTTPException(status_code=400, detail="Modelo deve ser 55 ou 65.")
+
+    serie = empresa.serie_nfe if modelo == 55 else empresa.serie_nfce
+    ultimo_numero = session.exec(
+        select(Nota.numero)
+        .where(
+            Nota.empresa_id == empresa_id,
+            Nota.modelo == str(modelo),
+            Nota.serie == serie,
+            Nota.numero.is_not(None),
+        )
+        .order_by(Nota.numero.desc())
+    ).first()
+
+    if ultimo_numero:
+        proximo = ultimo_numero + 1
+        fonte = "sequencial"
+    else:
+        inicial = empresa.proximo_nnf_inicial_nfe if modelo == 55 else empresa.proximo_nnf_inicial_nfce
+        proximo = inicial or 1
+        fonte = "migracao" if inicial else "inicio_serie"
+
+    return {
+        "modelo": modelo,
+        "serie": serie,
+        "proximo_numero": proximo,
+        "ultimo_emitido": ultimo_numero,
+        "fonte": fonte,  # "sequencial" | "migracao" | "inicio_serie"
+    }
+
 @router.post("/", response_model=NotaResponse)
 async def criar_e_transmitir_nota(
     empresa_id: int, 
@@ -94,10 +139,15 @@ async def criar_e_transmitir_nota(
         )
         .order_by(Nota.numero.desc())
     ).first()
-    # Série virgem no InnoFiscal: usa `proximo_nnf_inicial_*` da empresa (só relevante
-    # em migração de ERP — sem isso começaria em 1 e a SEFAZ rejeitaria com cStat 539
-    # duplicidade se o CNPJ já tiver emitido antes por outro sistema).
-    if ultimo_numero:
+    # Prioridade:
+    # 1) numero_override (operador escolheu na tela de preview antes de enviar SEFAZ)
+    # 2) ultimo_numero + 1 (MAX+1 normal)
+    # 3) empresa.proximo_nnf_inicial_* (migração de ERP; série virgem no InnoFiscal)
+    #    Sem isso começaria em 1 e a SEFAZ rejeitaria cStat 539 (duplicidade) se o
+    #    CNPJ já tiver emitido antes por outro sistema.
+    if nota_in.numero_override:
+        proximo_numero = nota_in.numero_override
+    elif ultimo_numero:
         proximo_numero = ultimo_numero + 1
     else:
         inicial = (empresa.proximo_nnf_inicial_nfe if modelo_int == 55

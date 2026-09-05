@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { FileText, Play, CheckCircle2, XCircle, Loader2, Download, ExternalLink, AlertCircle, Coins, Plus, Trash2, Edit3, Lock } from 'lucide-react';
+import { FileText, Play, CheckCircle2, XCircle, Loader2, Download, ExternalLink, AlertCircle, Coins, Plus, Trash2, Edit3, Lock, Send } from 'lucide-react';
 import api from '../../lib/api';
 import { useSearchParams } from 'react-router-dom';
 
@@ -153,6 +153,16 @@ function EmitirNotaAdminInterna() {
   const [resultado, setResultado] = useState<any>(null);
   const [erroEmissao, setErroEmissao] = useState<string>('');
   const [pollingActive, setPollingActive] = useState<boolean>(false);
+
+  // Preview / confirmação antes de mandar SEFAZ
+  const [previewOpen, setPreviewOpen] = useState<boolean>(false);
+  const [previewModelo, setPreviewModelo] = useState<'55' | '65' | null>(null);
+  const [previewNumero, setPreviewNumero] = useState<string>('');
+  const [previewSerie, setPreviewSerie] = useState<number>(1);
+  const [previewFonte, setPreviewFonte] = useState<string>('');
+  const [previewLoading, setPreviewLoading] = useState<boolean>(false);
+  const [previewErro, setPreviewErro] = useState<string>('');
+  const [previewJsonPayload, setPreviewJsonPayload] = useState<string>('');
   
   const [searchParams] = useSearchParams();
   const rascunhoId = searchParams.get('rascunho');
@@ -316,7 +326,81 @@ function EmitirNotaAdminInterna() {
   };
 
   // Enviar para emissão
-  const emitirDocumento = async (modelo: string) => {
+  // Valida + monta o jsonPayload da venda. Retorna a string, ou null se
+  // faltar dado (setErroEmissao já foi chamado). Usado tanto pela preview
+  // quanto pela emissão real — garante que a mesma validação roda em ambos.
+  const montarJsonPayloadVenda = (): string | null => {
+    if (modoEntrada === 'json') {
+      if (!jsonVenda.trim()) {
+        setErroEmissao("Cole o JSON de venda antes de emitir.");
+        return null;
+      }
+      try {
+        const parsed = JSON.parse(jsonVenda);
+        if (!parsed.itens || !Array.isArray(parsed.itens) || parsed.itens.length === 0) {
+          setErroEmissao("O JSON da venda precisa conter ao menos um item em 'itens'.");
+          return null;
+        }
+        return jsonVenda;
+      } catch (e: any) {
+        setErroEmissao(`JSON da Venda Inválido: ${e.message}`);
+        return null;
+      }
+    }
+    if (itensManuais.length === 0) {
+      setErroEmissao("Adicione ao menos um item na lista de itens.");
+      return null;
+    }
+    const totalNota = Math.max(0, itensManuais.reduce((acc, it) => acc + (it.quantidade * it.valor_unitario), 0) - descontoManual);
+    return JSON.stringify({
+      cliente: montarCliente(),
+      itens: itensManuais,
+      desconto: descontoManual,
+      pagamentos: [{ meio_pagamento: meioPagamento, valor: totalNota }]
+    });
+  };
+
+  // Abre modal de preview: valida payload, busca próximo nº sugerido no backend.
+  const abrirPreviewAdmin = async (modelo: '55' | '65') => {
+    setErroEmissao('');
+    setResultado(null);
+    if (!empresaSelecionada) {
+      setErroEmissao("Selecione uma empresa emissora antes de prosseguir.");
+      return;
+    }
+    const jsonPayload = montarJsonPayloadVenda();
+    if (!jsonPayload) return;
+
+    setPreviewJsonPayload(jsonPayload);
+    setPreviewModelo(modelo);
+    setPreviewErro('');
+    setPreviewLoading(true);
+    setPreviewOpen(true);
+    try {
+      const r = await api.get(`/empresas/${empresaSelecionada}/notas/proximo-numero`, { params: { modelo } });
+      setPreviewNumero(String(r.data.proximo_numero));
+      setPreviewSerie(Number(r.data.serie));
+      setPreviewFonte(String(r.data.fonte));
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail || e?.message || 'Não foi possível calcular o próximo número.';
+      setPreviewErro(String(detail));
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const confirmarEmissaoPreviewAdmin = () => {
+    if (!previewModelo) return;
+    const n = parseInt(previewNumero, 10);
+    if (!n || n < 1) { setPreviewErro('Número inválido — precisa ser inteiro ≥ 1.'); return; }
+    setPreviewOpen(false);
+    emitirDocumento(previewModelo, { jsonPayload: previewJsonPayload, numeroOverride: n });
+  };
+
+  const emitirDocumento = async (
+    modelo: string,
+    opts?: { jsonPayload?: string; numeroOverride?: number },
+  ) => {
     setErroEmissao('');
     setResultado(null);
 
@@ -325,36 +409,8 @@ function EmitirNotaAdminInterna() {
       return;
     }
 
-    let jsonPayload = '';
-    if (modoEntrada === 'json') {
-      if (!jsonVenda.trim()) {
-        setErroEmissao("Cole the JSON de venda antes de emitir.");
-        return;
-      }
-      try {
-        const parsed = JSON.parse(jsonVenda);
-        if (!parsed.itens || !Array.isArray(parsed.itens) || parsed.itens.length === 0) {
-          setErroEmissao("O JSON da venda precisa conter ao menos um item em 'itens'.");
-          return;
-        }
-        jsonPayload = jsonVenda;
-      } catch (e: any) {
-        setErroEmissao(`JSON da Venda Inválido: ${e.message}`);
-        return;
-      }
-    } else {
-      if (itensManuais.length === 0) {
-        setErroEmissao("Adicione ao menos um item na lista de itens.");
-        return;
-      }
-      const totalNota = Math.max(0, itensManuais.reduce((acc, it) => acc + (it.quantidade * it.valor_unitario), 0) - descontoManual);
-      jsonPayload = JSON.stringify({
-        cliente: montarCliente(),
-        itens: itensManuais,
-        desconto: descontoManual,
-        pagamentos: [{ meio_pagamento: meioPagamento, valor: totalNota }]
-      });
-    }
+    const jsonPayload = opts?.jsonPayload ?? montarJsonPayloadVenda();
+    if (!jsonPayload) return;
 
     setEmitindo(true);
 
@@ -362,7 +418,8 @@ function EmitirNotaAdminInterna() {
       const res = await api.post(`/empresas/${empresaSelecionada}/notas/`, {
         json_venda: jsonPayload,
         modelo: modelo,
-        rascunho_id: rascunhoId ? parseInt(rascunhoId) : undefined
+        rascunho_id: rascunhoId ? parseInt(rascunhoId) : undefined,
+        ...(opts?.numeroOverride ? { numero_override: opts.numeroOverride } : {}),
       });
       
       const nota = res.data;
@@ -933,7 +990,7 @@ function EmitirNotaAdminInterna() {
                     </div>
                   )}
                   <button
-                    onClick={() => emitirDocumento('65')}
+                    onClick={() => abrirPreviewAdmin('65')}
                     disabled={emitindo || pollingActive || !jsonValido || !empSelecionadaObj?.has_certificado}
                     className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-gradient-to-b from-i9 to-i9-dark text-white font-extrabold text-sm shadow hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
                   >
@@ -950,7 +1007,7 @@ function EmitirNotaAdminInterna() {
                     )}
                   </button>
                   <button
-                    onClick={() => emitirDocumento('55')}
+                    onClick={() => abrirPreviewAdmin('55')}
                     disabled={emitindo || pollingActive || !jsonValido || !empSelecionadaObj?.has_certificado}
                     className="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-white border border-i9 text-i9 font-extrabold text-sm shadow hover:bg-i9-tint/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
@@ -1054,6 +1111,85 @@ function EmitirNotaAdminInterna() {
         </div>
 
       </div>
+
+      {/* Modal preview: mostra numero/serie/valor antes de mandar SEFAZ.
+          Operador pode editar o numero pra bater com a numeracao real
+          (migracao de ERP, correcao pontual). */}
+      {previewOpen && (
+        <div className="fixed inset-0 bg-ink/60 backdrop-blur-sm z-[100] grid place-items-center p-6"
+             onClick={(e) => { if (e.target === e.currentTarget) setPreviewOpen(false); }}>
+          <div className="bg-card rounded-xl p-7 shadow-2xl w-[min(520px,100%)]">
+            <div className="w-12 h-12 rounded-xl bg-bg grid place-items-center mb-4">
+              <Send size={22} />
+            </div>
+            <h4 className="text-xl font-extrabold tracking-tight mb-1">
+              Confirmar transmissão · {previewModelo === '55' ? 'NF-e (mod 55)' : 'NFC-e (mod 65)'}
+            </h4>
+            <p className="text-sm text-muted mb-5">
+              Revise o número. Após enviar à SEFAZ, ele não pode ser reutilizado.
+            </p>
+
+            {previewLoading ? (
+              <div className="flex items-center gap-2 py-6 text-muted">
+                <Loader2 size={16} className="animate-spin" /> Calculando próximo número…
+              </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-3 mb-4">
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-muted">
+                      Número (nNF)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={previewNumero}
+                      onChange={(e) => { setPreviewNumero(e.target.value); setPreviewErro(''); }}
+                      className="bg-field border-2 border-line rounded-lg px-3 py-2.5 text-lg font-mono font-bold focus:border-i9 outline-none"
+                      autoFocus
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-muted">
+                      Série
+                    </label>
+                    <input
+                      type="text"
+                      value={previewSerie}
+                      disabled
+                      className="bg-line-soft border border-line rounded-lg px-3 py-2.5 text-lg font-mono font-bold text-muted"
+                    />
+                  </div>
+                </div>
+
+                {previewFonte === 'migracao' && (
+                  <div className="text-[11px] text-muted mb-3 bg-i9-tint border border-i9/20 rounded-lg px-3 py-2">
+                    Usando o número inicial cadastrado na empresa (migração de ERP).
+                  </div>
+                )}
+
+                {previewErro && (
+                  <div className="text-warn text-xs mb-3 bg-warn-tint border border-warn/30 rounded-lg px-3 py-2">
+                    {previewErro}
+                  </div>
+                )}
+
+                <div className="flex gap-2">
+                  <button onClick={() => setPreviewOpen(false)}
+                          className="flex-1 py-3 rounded-lg bg-bg text-muted font-extrabold text-sm">
+                    Cancelar
+                  </button>
+                  <button onClick={confirmarEmissaoPreviewAdmin}
+                          disabled={!previewNumero || emitindo}
+                          className="flex-1 py-3 rounded-lg bg-ink text-white font-extrabold text-sm inline-flex items-center justify-center gap-2 disabled:opacity-40">
+                    <Send size={14} /> Enviar SEFAZ
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

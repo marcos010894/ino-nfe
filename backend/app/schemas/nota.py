@@ -19,6 +19,9 @@ class NotaCreate(BaseModel):
     json_venda: str
     modelo: Optional[str] = "65"
     rascunho_id: Optional[int] = None
+    # Override do proximo nNF (ex: operador viu o preview e quer emitir com outro
+    # numero). NULL/0 = usa MAX+1 normal.
+    numero_override: Optional[int] = Field(default=None, ge=1)
 
 class NotaResponse(NotaBase):
     id: int
@@ -69,6 +72,10 @@ class ReceberVendaItem(BaseModel):
     quantidade: float = Field(gt=0)
     valor_unitario: float = Field(ge=0)
     unidade: str = "UN"
+    # NCM opcional. Se vier, o InnoFiscal usa o NCM do produto; se omitir,
+    # cai no `ncm_padrao` da regra fiscal da empresa. Aceita com ou sem
+    # formatação — só os dígitos são mandados pra SEFAZ (limite 8).
+    ncm: Optional[str] = None
 
 
 class ReceberVendaPagamento(BaseModel):
@@ -195,6 +202,41 @@ class DevolucaoPreviewResponse(BaseModel):
     destinatario: DestinatarioInput
     itens: List[DevolucaoItemInput]
     valor_total_original: float
+
+
+class DestinatarioReenvio(BaseModel):
+    """Dados de destinatário atualizáveis no reenvio de nota rejeitada.
+
+    Todos opcionais — o que vier substitui o campo correspondente no json_venda
+    salvo; o que não vier mantém o valor original.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    nome: Optional[str] = None
+    cpf: Optional[str] = None
+    cnpj: Optional[str] = None
+    email: Optional[str] = None
+    telefone: Optional[str] = None
+    logradouro: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    uf: Optional[str] = None
+    cep: Optional[str] = None
+    codigo_municipio: Optional[str] = None
+
+
+class NotaReenviar(BaseModel):
+    """Body opcional para POST /notas/{id}/reenviar.
+
+    Se vier `destinatario`, seus campos preenchidos sobrescrevem o
+    `cliente`/`cliente.endereco` do json_venda salvo antes da retransmissão.
+    Se o body inteiro for omitido, o payload original é retransmitido igual.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    destinatario: Optional[DestinatarioReenvio] = None
 
 
 class InutilizacaoRequest(BaseModel):

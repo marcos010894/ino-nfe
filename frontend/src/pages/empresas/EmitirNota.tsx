@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   AlertTriangle, CheckCircle2, Loader2, Lock, Mail, Printer,
-  Trash2, XCircle, Copy, ShieldAlert, Download,
+  Trash2, XCircle, Copy, ShieldAlert, Download, Send,
 } from 'lucide-react';
 import api from '../../lib/api';
 
@@ -79,6 +79,15 @@ export default function EmitirNota() {
   const [erroMsg, setErroMsg] = useState<string>('');
   const [pollingActive, setPollingActive] = useState<boolean>(false);
 
+  // Preview / confirmação antes de mandar SEFAZ
+  const [previewOpen, setPreviewOpen] = useState<boolean>(false);
+  const [previewModelo, setPreviewModelo] = useState<'55' | '65' | null>(null);
+  const [previewNumero, setPreviewNumero] = useState<string>('');
+  const [previewSerie, setPreviewSerie] = useState<number>(1);
+  const [previewFonte, setPreviewFonte] = useState<string>('');
+  const [previewLoading, setPreviewLoading] = useState<boolean>(false);
+  const [previewErro, setPreviewErro] = useState<string>('');
+
   // Cadeado técnico
   const [gavetaAberta, setGavetaAberta] = useState<boolean>(false);
   const [modalSenhaAberto, setModalSenhaAberto] = useState<boolean>(false);
@@ -116,12 +125,13 @@ export default function EmitirNota() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      if (modalSenhaAberto) setModalSenhaAberto(false);
+      if (previewOpen) setPreviewOpen(false);
+      else if (modalSenhaAberto) setModalSenhaAberto(false);
       else if (gavetaAberta) setGavetaAberta(false);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [modalSenhaAberto, gavetaAberta]);
+  }, [previewOpen, modalSenhaAberto, gavetaAberta]);
 
   // Parse do json_venda pra render de conferência
   const venda = useMemo(() => {
@@ -130,17 +140,41 @@ export default function EmitirNota() {
     try { return JSON.parse(fonte.json_venda); } catch { return null; }
   }, [rascunho, notaEmitida]);
 
-  // --- Emissão ---
-  async function emitir(modelo: '55' | '65') {
+  // --- Preview: pede o próximo nº ao backend e abre modal de confirmação ---
+  async function abrirPreview(modelo: '55' | '65') {
+    if (!empresaId) { setErroMsg('Selecione uma empresa emissora.'); return; }
+    if (!rascunho) { setErroMsg('Nenhuma venda carregada para emitir.'); return; }
+    setErroMsg('');
+    setPreviewErro('');
+    setPreviewModelo(modelo);
+    setPreviewLoading(true);
+    setPreviewOpen(true);
+    try {
+      const r = await api.get(`/empresas/${empresaId}/notas/proximo-numero`, { params: { modelo } });
+      setPreviewNumero(String(r.data.proximo_numero));
+      setPreviewSerie(Number(r.data.serie));
+      setPreviewFonte(String(r.data.fonte));
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail || e?.message || 'Não foi possível calcular o próximo número.';
+      setPreviewErro(String(detail));
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
+  // --- Emissão (chamada só após confirmação no modal de preview) ---
+  async function emitir(modelo: '55' | '65', numeroOverride?: number) {
     if (!empresaId) { setErroMsg('Selecione uma empresa emissora.'); return; }
     if (!rascunho) { setErroMsg('Nenhuma venda carregada para emitir.'); return; }
     setErroMsg('');
     setEtapa('transmitindo');
+    setPreviewOpen(false);
     try {
       const res = await api.post(`/empresas/${empresaId}/notas/`, {
         json_venda: rascunho.json_venda,
         modelo,
         rascunho_id: parseInt(String(rascunho.id), 10),
+        ...(numeroOverride ? { numero_override: numeroOverride } : {}),
       });
       const nota = res.data as Rascunho;
       setNotaEmitida(nota);
@@ -153,6 +187,13 @@ export default function EmitirNota() {
       setErroMsg(String(detail));
       setEtapa('invalidada');
     }
+  }
+
+  function confirmarEmissaoPreview() {
+    if (!previewModelo) return;
+    const n = parseInt(previewNumero, 10);
+    if (!n || n < 1) { setPreviewErro('Número inválido — precisa ser inteiro ≥ 1.'); return; }
+    emitir(previewModelo, n);
   }
 
   async function iniciarPolling(notaId: number) {
@@ -351,14 +392,14 @@ export default function EmitirNota() {
                 <div className="grid grid-cols-1 sm:grid-cols-[1.35fr_1fr] gap-3 mt-5">
                   <BotaoEmitir
                     disabled={etapa === 'transmitindo' || etapa === 'processando' || !!notaEmitida}
-                    onClick={() => emitir('65')}
+                    onClick={() => abrirPreview('65')}
                     primaria
                     titulo="Emitir NFC-e"
                     sub="Cupom para o consumidor · modelo 65"
                   />
                   <BotaoEmitir
                     disabled={etapa === 'transmitindo' || etapa === 'processando' || !!notaEmitida}
-                    onClick={() => emitir('55')}
+                    onClick={() => abrirPreview('55')}
                     primaria={false}
                     titulo="Emitir NF-e"
                     sub="Nota modelo 55"
@@ -421,6 +462,100 @@ export default function EmitirNota() {
       >
         <Lock size={11} /> JSON
       </button>
+
+      {/* Modal preview: mostra numero/serie/valor antes de mandar SEFAZ.
+          Operador pode editar o numero (ex: bater com a numeracao real da empresa
+          se migrou de outro ERP). */}
+      {previewOpen && (
+        <div className="fixed inset-0 bg-ink/60 backdrop-blur-sm z-[100] grid place-items-center p-6"
+             onClick={(e) => { if (e.target === e.currentTarget) setPreviewOpen(false); }}>
+          <div className="bg-card rounded-DEFAULT p-7 shadow-2xl w-[min(520px,100%)]">
+            <div className="w-12 h-12 rounded-xl bg-bg grid place-items-center mb-4">
+              <Send size={22} />
+            </div>
+            <h4 className="text-xl font-extrabold tracking-tight mb-1">
+              Confirmar emissão · {previewModelo === '55' ? 'NF-e (mod 55)' : 'NFC-e (mod 65)'}
+            </h4>
+            <p className="text-sm text-ink-soft mb-5">
+              Revise o número. Após enviar à SEFAZ, ele não pode ser reutilizado.
+            </p>
+
+            {previewLoading ? (
+              <div className="flex items-center gap-2 py-6 text-ink-soft">
+                <Loader2 size={16} className="animate-spin" /> Calculando próximo número…
+              </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-3 mb-4">
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-muted">
+                      Número (nNF)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={previewNumero}
+                      onChange={(e) => { setPreviewNumero(e.target.value); setPreviewErro(''); }}
+                      className="bg-field border-2 border-line rounded-lg px-3 py-2.5 text-lg font-mono font-bold focus:border-i9 outline-none"
+                      autoFocus
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-muted">
+                      Série
+                    </label>
+                    <input
+                      type="text"
+                      value={previewSerie}
+                      disabled
+                      className="bg-line-soft border border-line rounded-lg px-3 py-2.5 text-lg font-mono font-bold text-ink-soft"
+                    />
+                  </div>
+                </div>
+
+                {previewFonte === 'migracao' && (
+                  <div className="text-[11px] text-ink-soft mb-3 bg-i9-tint border border-i9/20 rounded-lg px-3 py-2">
+                    Usando o número inicial cadastrado na empresa (migração de ERP).
+                  </div>
+                )}
+
+                <div className="bg-bg rounded-lg p-3 mb-4 text-sm">
+                  <div className="flex justify-between mb-1">
+                    <span className="text-muted">Emissor</span>
+                    <b className="text-ink">{empresaAtual?.nome_fantasia || empresaAtual?.razao_social || '—'}</b>
+                  </div>
+                  <div className="flex justify-between mb-1">
+                    <span className="text-muted">Cliente</span>
+                    <b className="text-ink">{(venda?.cliente?.nome || 'Consumidor').toString().slice(0, 40)}</b>
+                  </div>
+                  <div className="flex justify-between pt-1 border-t border-line mt-2">
+                    <span className="text-muted font-bold">Valor total</span>
+                    <b className="text-lg font-extrabold">R$ {fmtMoeda(Number(rascunho?.valor_total || 0))}</b>
+                  </div>
+                </div>
+
+                {previewErro && (
+                  <div className="text-warn text-xs mb-3 bg-warn-tint border border-warn/30 rounded-lg px-3 py-2">
+                    {previewErro}
+                  </div>
+                )}
+
+                <div className="flex gap-2">
+                  <button onClick={() => setPreviewOpen(false)}
+                          className="flex-1 py-3 rounded-lg bg-bg text-ink-soft font-extrabold text-sm">
+                    Cancelar
+                  </button>
+                  <button onClick={confirmarEmissaoPreview}
+                          disabled={!previewNumero}
+                          className="flex-1 py-3 rounded-lg bg-ink text-white font-extrabold text-sm inline-flex items-center justify-center gap-2 disabled:opacity-40">
+                    <Send size={14} /> Enviar SEFAZ
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Modal senha */}
       {modalSenhaAberto && (
