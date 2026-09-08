@@ -53,3 +53,7 @@ class EmpresaResponse(EmpresaBase):
     acbr_sincronizado: bool = False
     acbr_ultimo_status: Optional[str] = None
 
+    # Master admin (flags de gestão)
+    bloqueada: bool = False
+    deletada_em: Optional[datetime] = None
+

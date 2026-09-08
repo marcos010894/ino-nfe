@@ -277,7 +277,24 @@ async def receber_venda_externa(
     Trava de fila: se o usuário tem nota anterior com status `rejeitada`, este
     endpoint responde HTTP 422 (`PENDENCIA_NOTA_ANTERIOR`) — o InnoSystem precisa
     corrigir/reenviar a pendente antes de mandar a próxima venda.
+
+    Trava master: se TODAS as empresas do usuário estão bloqueadas/deletadas pelo
+    admin, retorna 403 — evita gerar rascunho órfão que nunca vai ser processado.
     """
+    # Guard master: pelo menos uma empresa ativa (não bloqueada, não deletada)
+    empresa_ativa = session.exec(
+        select(Empresa).where(
+            Empresa.usuario_id == usuario.id,
+            Empresa.bloqueada == False,  # noqa: E712
+            Empresa.deletada_em.is_(None),
+        )
+    ).first()
+    if not empresa_ativa:
+        raise HTTPException(
+            status_code=403,
+            detail="Nenhuma empresa ativa disponível para emissão — contate o suporte.",
+        )
+
     _verificar_pendencia_fila_fiscal(usuario, session)
 
     subtotal = sum(item.quantidade * item.valor_unitario for item in payload.itens)
@@ -347,6 +364,10 @@ async def reenviar_nota_via_integracao(
     empresa = session.get(Empresa, nota.empresa_id)
     if not empresa or empresa.usuario_id != usuario.id:
         raise HTTPException(status_code=404, detail="Empresa da nota não encontrada.")
+    if empresa.deletada_em is not None:
+        raise HTTPException(status_code=410, detail="Empresa deletada.")
+    if empresa.bloqueada:
+        raise HTTPException(status_code=403, detail="Empresa bloqueada — contate o suporte.")
 
     # 3. Regra fiscal padrão da empresa
     regra = session.exec(
@@ -596,6 +617,10 @@ async def inutilizar_nota_integracao(
     empresa = session.get(Empresa, nota.empresa_id)
     if not empresa or empresa.usuario_id != usuario.id:
         raise HTTPException(status_code=404, detail="Empresa da nota não encontrada.")
+    if empresa.deletada_em is not None:
+        raise HTTPException(status_code=410, detail="Empresa deletada.")
+    if empresa.bloqueada:
+        raise HTTPException(status_code=403, detail="Empresa bloqueada — contate o suporte.")
 
     modelo_int = 55 if nota.modelo == "55" else 65
     ano = (nota.criado_em or datetime.utcnow()).year

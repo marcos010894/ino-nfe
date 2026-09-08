@@ -13,6 +13,30 @@ from app.services.acbr_api import ACBrAPIService
 
 router = APIRouter(prefix="/empresas", tags=["Empresas"])
 
+def _extrair_msg_erro_acbr(res: dict) -> str:
+    """Extrai a mensagem legível de um response de erro da ACBr API.
+
+    Formatos observados em prod:
+      - {"error": {"code": "ValidationFailed", "message": "..."}}  ← Keycloak/validação
+      - {"erro": "connection timeout ..."}                          ← nosso wrapper de exceção
+      - {"status_code": 400, "raw": "..."}                          ← body não-JSON
+      - {"motivo": "..."} / {"status": "..."}                       ← sucesso mascarado
+    """
+    if not isinstance(res, dict):
+        return str(res)
+    err = res.get("error")
+    if isinstance(err, dict) and err.get("message"):
+        return str(err["message"])
+    if res.get("erro"):
+        return str(res["erro"])
+    if res.get("motivo"):
+        return str(res["motivo"])
+    if res.get("raw"):
+        return str(res["raw"])[:300]
+    sc = res.get("status_code")
+    return f"HTTP {sc}" if sc else str(res)[:300]
+
+
 def format_empresa_response(empresa: Empresa) -> EmpresaResponse:
     return EmpresaResponse(
         **empresa.dict(),
@@ -64,7 +88,12 @@ async def testar_conexao_acbr(current_user: Usuario = Depends(get_current_user))
 
 @router.get("/", response_model=List[EmpresaResponse])
 def listar_empresas(session: Session = Depends(get_session), current_user: Usuario = Depends(get_current_user)):
-    empresas = session.exec(select(Empresa).where(Empresa.usuario_id == current_user.id)).all()
+    empresas = session.exec(
+        select(Empresa).where(
+            Empresa.usuario_id == current_user.id,
+            Empresa.deletada_em.is_(None),
+        )
+    ).all()
     return [format_empresa_response(emp) for emp in empresas]
 
 @router.post("/", response_model=EmpresaResponse)
@@ -125,11 +154,15 @@ async def atualizar_empresa(empresa_id: int, emp_in: EmpresaUpdate, session: Ses
 
 @router.delete("/{empresa_id}")
 def deletar_empresa(empresa_id: int, session: Session = Depends(get_session), current_user: Usuario = Depends(get_current_user)):
+    """Soft-delete: mantém empresa + notas no banco (obrigação fiscal 5 anos),
+    mas some da listagem do dono. Hard delete só via SQL manual do admin."""
     empresa = session.get(Empresa, empresa_id)
     if not empresa or empresa.usuario_id != current_user.id:
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
-    session.delete(empresa)
-    session.commit()
+    if empresa.deletada_em is None:
+        empresa.deletada_em = datetime.utcnow()
+        session.add(empresa)
+        session.commit()
     return {"ok": True}
 
 @router.post("/{empresa_id}/certificado", response_model=EmpresaResponse)
@@ -166,12 +199,19 @@ async def upload_certificado(
     if ok:
         empresa.acbr_ultimo_status = f"Certificado: {res.get('motivo') or res.get('status') or 'Ativo no ACBr'}"
     else:
-        empresa.acbr_ultimo_status = f"Erro certificado: {res.get('erro') or res.get('status_code') or res}"
+        msg = _extrair_msg_erro_acbr(res)
+        empresa.acbr_ultimo_status = f"Erro certificado: {msg}"
 
+    # Persistir cert local mesmo em falha — usuário pode corrigir CNPJ e reenviar
+    # sem precisar refazer upload do .pfx.
     session.add(empresa)
     session.commit()
     session.refresh(empresa)
-    
+
+    if not ok:
+        # Sem simulação silenciosa: SEFAZ/ACBr falhou de verdade → 400 com msg pro UI.
+        raise HTTPException(status_code=400, detail=f"ACBr rejeitou o certificado: {_extrair_msg_erro_acbr(res)}")
+
     return format_empresa_response(empresa)
 
 @router.post("/{empresa_id}/sincronizar-acbr", response_model=EmpresaResponse)
@@ -187,7 +227,12 @@ async def sincronizar_acbr(empresa_id: int, session: Session = Depends(get_sessi
     if ok_emp:
         status_msg = res_emp.get("motivo") or res_emp.get("status") or "Dados sincronizados"
     else:
-        status_msg = f"Erro sync: {res_emp.get('erro') or res_emp.get('status_code') or res_emp}"
+        status_msg = f"Erro sync: {_extrair_msg_erro_acbr(res_emp)}"
+
+    # Coletar erros pra levantar 400 no fim (sem esconder falha em 200 OK).
+    erros: list = []
+    if not ok_emp:
+        erros.append(f"empresa: {_extrair_msg_erro_acbr(res_emp)}")
 
     if empresa.certificado_base64 and empresa.certificado_senha:
         senha_descriptografada = decrypt_data(empresa.certificado_senha)
@@ -196,13 +241,18 @@ async def sincronizar_acbr(empresa_id: int, session: Session = Depends(get_sessi
         if ok_cert:
             status_msg += f" | Certificado: {res_cert.get('motivo') or res_cert.get('status') or 'Ativo'}"
         else:
-            status_msg += f" | Erro cert: {res_cert.get('erro') or res_cert.get('status_code') or res_cert}"
+            msg_cert = _extrair_msg_erro_acbr(res_cert)
+            status_msg += f" | Erro cert: {msg_cert}"
+            erros.append(f"certificado: {msg_cert}")
 
     empresa.acbr_sincronizado = ok_emp
     empresa.acbr_ultimo_status = status_msg
     session.add(empresa)
     session.commit()
     session.refresh(empresa)
-    
+
+    if erros:
+        raise HTTPException(status_code=400, detail="ACBr rejeitou sincronização — " + "; ".join(erros))
+
     return format_empresa_response(empresa)
 

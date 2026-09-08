@@ -308,7 +308,17 @@ export default function EmpresaForm() {
       }));
       setAcbrStatusMsg(res.data.acbr_ultimo_status || 'Sincronizado com sucesso com ACBr!');
     } catch (err: any) {
-      setAcbrStatusMsg('Erro ao comunicar com a ACBr API.');
+      // Backend propaga rejeição da ACBr como 400 detail — mostra a mensagem
+      // real (ex: "certificado possui CPF/CNPJ diferente da empresa") em vez
+      // de "Erro ao comunicar" genérico que esconde a causa.
+      const detail = err?.response?.data?.detail;
+      setAcbrStatusMsg(
+        typeof detail === 'string'
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : 'Erro ao comunicar com a ACBr API.'
+      );
     } finally {
       setSincronizandoAcbr(false);
     }
@@ -356,12 +366,18 @@ export default function EmpresaForm() {
           </div>
         )}
 
-        {acbrStatusMsg && (
-          <div className="bg-blue-500/10 text-blue-400 border border-blue-500/30 p-3 rounded-lg text-sm font-semibold flex items-center gap-2">
-            <Zap size={16} />
-            {acbrStatusMsg}
-          </div>
-        )}
+        {acbrStatusMsg && (() => {
+          const isErro = /erro|rejeit|falh/i.test(acbrStatusMsg);
+          const cls = isErro
+            ? 'bg-red-500/10 text-red-400 border-red-500/30'
+            : 'bg-blue-500/10 text-blue-400 border-blue-500/30';
+          return (
+            <div className={`${cls} border p-3 rounded-lg text-sm font-semibold flex items-start gap-2`}>
+              <Zap size={16} className="mt-0.5 flex-shrink-0" />
+              <span>{acbrStatusMsg}</span>
+            </div>
+          );
+        })()}
 
 
         {/* Bloco: Dados Gerais */}

@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.models.database import init_db
-from app.api import auth, empresas, regras_fiscais, notas, integracao
+from app.api import auth, empresas, regras_fiscais, notas, integracao, admin
 
 app = FastAPI(title="InnoNFe API", description="API para emissão fiscal", version="1.0.0")
 
@@ -28,6 +28,7 @@ app.include_router(empresas.router)
 app.include_router(regras_fiscais.router)
 app.include_router(notas.router)
 app.include_router(integracao.router)
+app.include_router(admin.router)
 
 # Servir o frontend (React dist)
 import os

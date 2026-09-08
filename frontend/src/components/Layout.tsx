@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react';
 import { Outlet, Navigate, useNavigate, Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, Building2, FileText, Files, LogOut, Undo2 } from 'lucide-react';
+import { LayoutDashboard, Building2, FileText, Files, LogOut, Undo2, ShieldCheck, Gauge } from 'lucide-react';
 import { isAuthenticated, removeToken } from '../lib/auth';
 import api from '../lib/api';
+
+type MeUser = { nome: string; email: string; is_admin?: boolean };
 
 export default function Layout() {
   const navigate = useNavigate();
   const location = useLocation();
   const [loading, setLoading] = useState(true);
-  const [user, setUser] = useState<{nome: string, email: string} | null>(null);
+  const [user, setUser] = useState<MeUser | null>(null);
 
   useEffect(() => {
     if (!isAuthenticated()) {
@@ -40,14 +42,17 @@ export default function Layout() {
     navigate('/login');
   };
 
-  const navItems = [
-    { name: 'Dashboard', path: '/', icon: <LayoutDashboard size={18} /> },
-    { name: 'Empresas', path: '/empresas', icon: <Building2 size={18} /> },
-    { name: 'Emitir Nota', path: '/emitir', icon: <FileText size={18} /> },
-    { name: 'Emitir Devolução', path: '/emitir/devolucao', icon: <Undo2 size={18} /> },
-    { name: 'Documentos', path: '/documentos', icon: <Files size={18} /> },
-    { name: 'Notas Recebidas', path: '/documentos/rascunhos', icon: <FileText size={18} /> },
+  const allNavItems = [
+    { name: 'Dashboard', path: '/', icon: <LayoutDashboard size={18} />, adminOnly: false },
+    { name: 'Empresas', path: '/empresas', icon: <Building2 size={18} />, adminOnly: false },
+    { name: 'Emitir Nota', path: '/emitir', icon: <FileText size={18} />, adminOnly: false },
+    { name: 'Emitir Devolução', path: '/emitir/devolucao', icon: <Undo2 size={18} />, adminOnly: false },
+    { name: 'Documentos', path: '/documentos', icon: <Files size={18} />, adminOnly: false },
+    { name: 'Notas Recebidas', path: '/documentos/rascunhos', icon: <FileText size={18} />, adminOnly: false },
+    { name: 'Admin · Dashboard', path: '/admin/dashboard', icon: <Gauge size={18} />, adminOnly: true },
+    { name: 'Admin · Empresas', path: '/admin/empresas', icon: <ShieldCheck size={18} />, adminOnly: true },
   ];
+  const navItems = allNavItems.filter(item => !item.adminOnly || user.is_admin);
 
   return (
     <div className="min-h-screen bg-bg flex flex-col md:flex-row">

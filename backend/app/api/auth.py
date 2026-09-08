@@ -30,6 +30,15 @@ def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Dep
         raise credentials_exception
     return usuario
 
+
+def get_current_admin(user: Usuario = Depends(get_current_user)) -> Usuario:
+    """Dep FastAPI que exige perfil master. Bootstrap manual via SQL:
+    `UPDATE usuarios SET is_admin=1 WHERE email='...';`"""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Requer perfil admin.")
+    return user
+
+
 @router.post("/register", response_model=UsuarioResponse)
 def register(user_in: UsuarioCreate, session: Session = Depends(get_session)):
     # Verifica se já existe o email

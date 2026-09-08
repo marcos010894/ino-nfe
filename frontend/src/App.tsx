@@ -13,6 +13,8 @@ import EmitirNotaAdmin from './pages/empresas/EmitirNotaAdmin';
 import EmitirDevolucao from './pages/empresas/EmitirDevolucao';
 import CentralDocumentos from './pages/empresas/CentralDocumentos';
 import NotasRecebidas from './pages/documentos/NotasRecebidas';
+import EmpresasAdmin from './pages/admin/EmpresasAdmin';
+import DashboardAdmin from './pages/admin/DashboardAdmin';
 import { isAuthenticated } from './lib/auth';
 
 function PublicRoute({ children }: { children: React.ReactNode }) {
@@ -43,6 +45,10 @@ export default function App() {
           <Route path="emitir/devolucao" element={<EmitirDevolucao />} />
           <Route path="documentos" element={<CentralDocumentos />} />
           <Route path="documentos/rascunhos" element={<NotasRecebidas />} />
+          {/* Master admin — guard is_admin inline em cada página (401 na API + Navigate no front). */}
+          <Route path="admin" element={<Navigate to="/admin/dashboard" replace />} />
+          <Route path="admin/dashboard" element={<DashboardAdmin />} />
+          <Route path="admin/empresas" element={<EmpresasAdmin />} />
         </Route>
         
         <Route path="*" element={<Navigate to="/" replace />} />

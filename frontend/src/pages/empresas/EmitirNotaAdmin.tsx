@@ -391,10 +391,9 @@ function EmitirNotaAdminInterna() {
 
   const confirmarEmissaoPreviewAdmin = () => {
     if (!previewModelo) return;
-    const n = parseInt(previewNumero, 10);
-    if (!n || n < 1) { setPreviewErro('Número inválido — precisa ser inteiro ≥ 1.'); return; }
+    // Número é read-only — usa o calculado pelo backend (sem override).
     setPreviewOpen(false);
-    emitirDocumento(previewModelo, { jsonPayload: previewJsonPayload, numeroOverride: n });
+    emitirDocumento(previewModelo, { jsonPayload: previewJsonPayload });
   };
 
   const emitirDocumento = async (
@@ -1141,12 +1140,10 @@ function EmitirNotaAdminInterna() {
                       Número (nNF)
                     </label>
                     <input
-                      type="number"
-                      min={1}
+                      type="text"
                       value={previewNumero}
-                      onChange={(e) => { setPreviewNumero(e.target.value); setPreviewErro(''); }}
-                      className="bg-field border-2 border-line rounded-lg px-3 py-2.5 text-lg font-mono font-bold focus:border-i9 outline-none"
-                      autoFocus
+                      disabled
+                      className="bg-line-soft border border-line rounded-lg px-3 py-2.5 text-lg font-mono font-bold text-ink-soft"
                     />
                   </div>
                   <div className="flex flex-col gap-1.5">

@@ -52,6 +52,11 @@ class Empresa(SQLModel, table=True):
     # Integração ACBr API
     acbr_sincronizado: bool = Field(default=False)
     acbr_ultimo_status: Optional[str] = None
-    
+
+    # Master admin — bloqueada trava novas emissões (mantém histórico); deletada_em
+    # é soft-delete (some da lista do dono, mas notas ficam por 5 anos).
+    bloqueada: bool = Field(default=False)
+    deletada_em: Optional[datetime] = Field(default=None, index=True)
+
     criado_em: datetime = Field(default_factory=datetime.utcnow)
 

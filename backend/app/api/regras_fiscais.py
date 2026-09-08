@@ -14,6 +14,10 @@ def _verificar_empresa(empresa_id: int, session: Session, current_user: Usuario)
     empresa = session.get(Empresa, empresa_id)
     if not empresa or empresa.usuario_id != current_user.id:
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
+    if empresa.deletada_em is not None:
+        raise HTTPException(status_code=410, detail="Empresa deletada.")
+    if empresa.bloqueada:
+        raise HTTPException(status_code=403, detail="Empresa bloqueada — contate o suporte.")
     return empresa
 
 def _ajustar_regra_padrao(empresa_id: int, regra_id_padrao: int, session: Session):
