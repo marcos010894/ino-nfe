@@ -10,17 +10,104 @@ import uuid
 from app.models.database import get_session
 from app.models.usuario import Usuario
 from app.models.nota import Nota
+from app.models.empresa import Empresa
+from app.models.regra_fiscal import RegraFiscal
 from app.schemas.nota import NotaResponse, ReceberVendaPayload
 from app.api.auth import get_current_user
 from app.core.security import create_access_token
 from app.services.acbr_api import ACBrAPIService
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/integracao", tags=["Integração Externa"])
 
 # TTL curto pra sessão SSO — o usuário só precisa dele pra abrir a tela;
 # depois a autenticação vira responsabilidade do JWT normal do app.
 SSO_JWT_TTL_MINUTES = 15
+
+# cStats de denegação — SEFAZ consumiu o nNF mas recusa autorização
+# permanentemente. NÃO reenviar (nNF já queimado); próxima nota segue nNF+1.
+# 110 = uso denegado; 301 = irregularidade fiscal do emitente;
+# 302 = irregularidade fiscal do destinatário.
+CSTAT_DENEGACAO = {"110", "301", "302"}
+
+# Status que travam a fila de nova emissão (nNF ainda não consumido pela SEFAZ,
+# operador precisa corrigir/inutilizar/consultar antes da próxima). Denegada NÃO
+# trava — consumiu o nNF e a fila segue.
+# - rejeitada: SEFAZ rejeitou explicitamente; corrigir e reenviar OU inutilizar.
+# - pendente_consulta: timeout/erro de comunicação; status real desconhecido,
+#   precisa consultar SEFAZ por chave antes de decidir o próximo passo.
+STATUS_BLOQUEIA_FILA = {"rejeitada", "pendente_consulta"}
+
+
+def _eh_denegacao(codigo_status: Optional[Any]) -> bool:
+    """True se o cStat da SEFAZ indica denegação (nNF consumido, sem reenvio)."""
+    if codigo_status is None:
+        return False
+    return str(codigo_status).strip() in CSTAT_DENEGACAO
+
+
+def _eh_timeout_acbr(resposta: Optional[Dict[str, Any]]) -> bool:
+    """True quando ACBr/SEFAZ NÃO deu resposta definitiva no envio.
+
+    O service `ACBrAPIService.transmitir_*` devolve `("processando", {"erro": "..."})`
+    em três casos:
+    - Falha de autenticação Keycloak (envio nem começou)
+    - Erro de comunicação HTTP (timeout, TLS, DNS) — SEFAZ pode ter recebido ou não
+    - Exception parseando o JSON de resposta
+
+    Nesses cenários o status real da nota é INCERTO — não dá pra assumir rejeitada
+    (a SEFAZ pode ter autorizado e a resposta se perdeu no caminho). O InnoFiscal
+    marca como `pendente_consulta` e o InnoSystem chama `POST /notas/{id}/consultar`
+    pra resolver.
+
+    Diferente de: `("processando", {"id": "nfe_...", "status": "processando"})` que
+    é fila assíncrona legítima da NF-e — resposta tem id, sem chave `erro` — o
+    polling normal via GET resolve.
+    """
+    if resposta is None:
+        return True
+    return bool(resposta.get("erro"))
+
+
+def _verificar_pendencia_fila_fiscal(usuario: Usuario, session: Session) -> None:
+    """Recusa nova emissão se existe nota anterior rejeitada do mesmo usuário.
+
+    Regra fiscal: `nNF` é sequencial ascendente por (empresa, modelo, série).
+    Se a última nota foi rejeitada e o operador emitir a próxima antes de
+    corrigir/inutilizar, o `nNF` rejeitado fica pulado — furo de sequência
+    que a SEFAZ vai questionar.
+
+    Denegada NÃO bloqueia (nNF consumido, próxima segue nNF+1).
+    Levanta HTTP 422 com payload `ERRO_INTERNO_REGRA_FISCAL /
+    PENDENCIA_NOTA_ANTERIOR` apontando a nota que precisa ser resolvida.
+    """
+    pendente = session.exec(
+        select(Nota)
+        .where(Nota.usuario_id == usuario.id)
+        .where(Nota.status.in_(STATUS_BLOQUEIA_FILA))
+        .order_by(Nota.criado_em.desc())
+    ).first()
+    if not pendente:
+        return
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "sucesso": False,
+            "tipo_erro": "ERRO_INTERNO_REGRA_FISCAL",
+            "codigo_erro": "PENDENCIA_NOTA_ANTERIOR",
+            "mensagem": (
+                f"Não foi possível emitir a nova nota fiscal. Existe uma nota "
+                f"fiscal anterior (ID: {pendente.id}, "
+                f"Número: {pendente.numero}) que foi rejeitada pela SEFAZ e "
+                f"precisa ser corrigida/retransmitida antes de prosseguir."
+            ),
+            "detalhes": {
+                "id_nota_pendente": pendente.id,
+                "numero_nota_pendente": pendente.numero,
+                "status_atual": pendente.status,
+            },
+        },
+    )
 
 
 class SessaoSSOResponse(BaseModel):
@@ -186,7 +273,13 @@ async def receber_venda_externa(
     Formato canônico (mesmo enviado pelo InnoSystem): cliente + itens (código/nome/
     quantidade/valor_unitario/unidade) + desconto + pagamentos. O valor_total é
     calculado no servidor a partir dos itens - desconto.
+
+    Trava de fila: se o usuário tem nota anterior com status `rejeitada`, este
+    endpoint responde HTTP 422 (`PENDENCIA_NOTA_ANTERIOR`) — o InnoSystem precisa
+    corrigir/reenviar a pendente antes de mandar a próxima venda.
     """
+    _verificar_pendencia_fila_fiscal(usuario, session)
+
     subtotal = sum(item.quantidade * item.valor_unitario for item in payload.itens)
     valor_total = subtotal - payload.desconto
 
@@ -204,6 +297,353 @@ async def receber_venda_externa(
     session.refresh(nova_nota)
 
     return nova_nota
+
+
+@router.post("/reenviar/{nota_id}", response_model=NotaResponse)
+async def reenviar_nota_via_integracao(
+    nota_id: int,
+    payload: ReceberVendaPayload = Body(
+        ...,
+        description=(
+            "JSON de venda corrigido — mesmo shape do POST /receber-venda. "
+            "Substitui o json_venda salvo antes de retransmitir."
+        ),
+    ),
+    usuario: Usuario = Depends(get_user_by_api_key),
+    session: Session = Depends(get_session),
+):
+    """Reenvia uma nota REJEITADA reaproveitando o mesmo `nNF` e `serie`.
+
+    Uso: quando a SEFAZ rejeitou uma nota e o InnoSystem já corrigiu o
+    cadastro (cliente, produto, valor). Manda o JSON corrigido apontando pra
+    nota rejeitada e o InnoFiscal retransmite mantendo a numeração.
+
+    Regras:
+    - `nota_id` deve pertencer ao usuário do X-API-Key.
+    - Nota precisa estar com `status="rejeitada"`.
+    - Nota precisa ter `numero` e `empresa_id` já reservados (só quem transmitiu
+      pelo menos uma vez tem isso — rascunhos puros não são reenviáveis).
+    - Retransmite direto (não vira rascunho — o InnoSystem já validou os dados).
+    """
+    # 1. Carregar nota e validar
+    nota = _carregar_nota_do_usuario(nota_id, usuario, session)
+    if nota.status != "rejeitada":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Só é possível reenviar notas com status='rejeitada'. Status atual: '{nota.status}'.",
+        )
+    if nota.numero is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Nota rejeitada sem número reservado — impossível reenviar sem gerar furo.",
+        )
+    if nota.empresa_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Nota rejeitada sem empresa vinculada — nunca foi transmitida. Use /receber-venda.",
+        )
+
+    # 2. Carregar empresa (o usuário do X-API-Key precisa ser o dono)
+    empresa = session.get(Empresa, nota.empresa_id)
+    if not empresa or empresa.usuario_id != usuario.id:
+        raise HTTPException(status_code=404, detail="Empresa da nota não encontrada.")
+
+    # 3. Regra fiscal padrão da empresa
+    regra = session.exec(
+        select(RegraFiscal).where(RegraFiscal.empresa_id == empresa.id, RegraFiscal.padrao == True)
+    ).first()
+    if not regra:
+        regra = session.exec(
+            select(RegraFiscal).where(RegraFiscal.empresa_id == empresa.id)
+        ).first()
+    if not regra:
+        raise HTTPException(status_code=400, detail="Nenhuma regra fiscal cadastrada para a empresa.")
+
+    # 4. Substituir json_venda pelo payload corrigido + recalcular total
+    venda_data = payload.model_dump()
+    v_prod = sum(float(it.get("quantidade", 0)) * float(it.get("valor_unitario", 0)) for it in venda_data.get("itens", []))
+    v_desc = float(venda_data.get("desconto", 0.0))
+    valor_total = round(v_prod - v_desc, 2)
+
+    # 5. Montar payload ACBr — REUSA nNF/serie da nota original
+    modelo_int = int(nota.modelo) if nota.modelo else 65
+    acbr_service = ACBrAPIService()
+    try:
+        payload_acbr = acbr_service.montar_payload_nfce(
+            empresa, regra, venda_data,
+            modelo=modelo_int, numero=nota.numero, serie=nota.serie or 1,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao gerar payload fiscal: {str(e)}")
+
+    # 6. Atualizar registro (mesma nota, não cria nova)
+    nota.status = "processando"
+    nota.valor_total = valor_total
+    nota.json_venda = json.dumps(venda_data)
+    nota.payload_enviado = json.dumps(payload_acbr)
+    nota.atualizado_em = datetime.utcnow()
+    session.add(nota)
+    session.commit()
+    session.refresh(nota)
+
+    # 7. Transmitir
+    if modelo_int == 55:
+        status, resposta = await acbr_service.transmitir_nfe(payload_acbr)
+    else:
+        status, resposta = await acbr_service.transmitir_nfce(payload_acbr)
+
+    # 8. Tratar retorno
+    nota.status = status
+    nota.resposta_integradora = json.dumps(resposta)
+    nota.atualizado_em = datetime.utcnow()
+
+    if status == "autorizada":
+        nota.acbr_id = resposta.get("id")
+        nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso")
+        acbr_numero = resposta.get("numero") or resposta.get("numeroNota")
+        if acbr_numero is not None:
+            nota.numero = acbr_numero
+        acbr_serie = resposta.get("serie")
+        if acbr_serie is not None:
+            nota.serie = acbr_serie
+        if nota.acbr_id:
+            if nota.acbr_id.startswith("nfc_"):
+                nota.modelo = "65"
+            elif nota.acbr_id.startswith("nfe_"):
+                nota.modelo = "55"
+        nota.pdf_url = f"/empresas/{empresa.id}/notas/{nota.id}/pdf"
+        nota.xml_url = f"/empresas/{empresa.id}/notas/{nota.id}/xml"
+    elif status == "processando":
+        nota.acbr_id = resposta.get("id")
+        nota.chave_acesso = (
+            resposta.get("chave") or resposta.get("chaveAcesso") or payload_acbr.get("referencia")
+        )
+        # Timeout/erro comm com ACBr: SEFAZ pode ter recebido ou não. Marca
+        # pendente_consulta e trava a fila até `POST /notas/{id}/consultar` resolver.
+        if _eh_timeout_acbr(resposta):
+            nota.status = "pendente_consulta"
+        nota.pdf_url = f"/empresas/{empresa.id}/notas/{nota.id}/pdf"
+        nota.xml_url = f"/empresas/{empresa.id}/notas/{nota.id}/xml"
+    else:
+        # Rejeição de novo — achata motivo/cstat no topo
+        aut = resposta.get("autorizacao") or {}
+        err = resposta.get("error") or {}
+        motivo = (
+            aut.get("motivo_status")
+            or resposta.get("motivo_status")
+            or err.get("message")
+            or resposta.get("motivo")
+            or resposta.get("mensagem")
+            or (resposta.get("erro") if isinstance(resposta.get("erro"), str) else None)
+            or "Rejeição desconhecida"
+        )
+        cstat = aut.get("codigo_status") or resposta.get("codigo_status") or err.get("code")
+        resposta = {**resposta, "motivo_status": motivo, "codigo_status": cstat}
+        # Denegação (110/301/302) consome o nNF mas trava o reenvio — status
+        # próprio pra o InnoSystem parar de tentar reenviar essa nota.
+        if _eh_denegacao(cstat):
+            nota.status = "denegada"
+        nota.resposta_integradora = json.dumps(resposta)
+        nota.acbr_id = resposta.get("id") or nota.acbr_id
+
+    session.add(nota)
+    session.commit()
+    session.refresh(nota)
+    return nota
+
+
+# ---------------------------------------------------------------------------
+# Consulta por chave — destrava `pendente_consulta` / atualiza `processando`
+# ---------------------------------------------------------------------------
+
+
+def _resolver_modelo_para_consulta(nota: Nota) -> int:
+    """Prefixo do acbr_id vence; fallback pro campo `modelo` da nota."""
+    if nota.acbr_id:
+        if nota.acbr_id.startswith("nfc_"):
+            return 65
+        if nota.acbr_id.startswith("nfe_"):
+            return 55
+    return 55 if nota.modelo == "55" else 65
+
+
+@router.post("/notas/{nota_id}/consultar", response_model=NotaIntegracaoResponse)
+async def consultar_nota_integracao(
+    nota_id: int,
+    usuario: Usuario = Depends(get_user_by_api_key),
+    session: Session = Depends(get_session),
+):
+    """Consulta o status real na SEFAZ pra destravar `pendente_consulta` ou finalizar `processando`.
+
+    Uso: quando o `POST /receber-venda`/emissão retornou timeout (SEFAZ pode ter
+    recebido ou não), a nota fica `pendente_consulta` e trava a fila. Este
+    endpoint consulta a SEFAZ e resolve:
+
+    - SEFAZ autorizou → `autorizada` (fila destrava, XML/PDF disponíveis)
+    - SEFAZ rejeitou → `rejeitada` (corrigir + `/reenviar` ou `/inutilizar`)
+    - SEFAZ denegou (cStat 110/301/302) → `denegada` (fila destrava, nNF queimado)
+    - SEFAZ diz "não encontrada" → mantém `pendente_consulta` (payload nem chegou,
+      pode reenviar mesmo nNF via `/reenviar`)
+    - Ainda processando na fila SEFAZ (raro) → mantém `processando`
+
+    Idempotente: chamar em nota já autorizada/rejeitada/etc devolve o estado atual
+    sem consultar de novo.
+    """
+    nota = _carregar_nota_do_usuario(nota_id, usuario, session)
+
+    # Estados terminais — nada a consultar
+    if nota.status not in ("processando", "pendente_consulta"):
+        return _nota_para_response(nota)
+
+    identificador = nota.acbr_id or nota.chave_acesso
+    if not identificador and nota.payload_enviado:
+        try:
+            identificador = json.loads(nota.payload_enviado).get("referencia")
+        except (ValueError, TypeError):
+            pass
+    if not identificador:
+        raise HTTPException(
+            status_code=400,
+            detail="Nota sem identificador (acbr_id/chave/referencia) — impossível consultar SEFAZ.",
+        )
+
+    modelo_int = _resolver_modelo_para_consulta(nota)
+    acbr = ACBrAPIService()
+    ok, resposta = await acbr.consultar_documento(identificador, modelo=modelo_int)
+
+    # Sem dado útil da ACBr → mantém pendente_consulta pra próxima tentativa.
+    # NÃO devolve 502 pra não travar o InnoSystem em polling agressivo.
+    if not ok or _eh_timeout_acbr(resposta):
+        return _nota_para_response(nota)
+
+    acbr_status = str(resposta.get("status") or "").lower()
+    aut = resposta.get("autorizacao") or {}
+    cstat = aut.get("codigo_status") or resposta.get("codigo_status")
+
+    if _eh_denegacao(cstat):
+        nota.status = "denegada"
+    elif acbr_status.startswith("autoriz"):
+        nota.status = "autorizada"
+        nota.chave_acesso = (
+            resposta.get("chave") or resposta.get("chaveAcesso") or nota.chave_acesso
+        )
+    elif acbr_status.startswith("rejeit"):
+        nota.status = "rejeitada"
+    # senão: SEFAZ ainda não decidiu — deixa status como está (processando ou pendente_consulta)
+
+    if resposta.get("id") and not nota.acbr_id:
+        nota.acbr_id = resposta.get("id")
+    nota.resposta_integradora = json.dumps(resposta)
+    nota.atualizado_em = datetime.utcnow()
+    session.add(nota)
+    session.commit()
+    session.refresh(nota)
+    return _nota_para_response(nota)
+
+
+# ---------------------------------------------------------------------------
+# Inutilização de UMA nota (último recurso — destrava a fila)
+# ---------------------------------------------------------------------------
+
+
+class InutilizarNotaRequest(BaseModel):
+    """Body do POST /integracao/inutilizar/{id}."""
+    justificativa: str = Field(..., min_length=15, max_length=255)
+
+
+@router.post("/inutilizar/{nota_id}")
+async def inutilizar_nota_integracao(
+    nota_id: int,
+    body: InutilizarNotaRequest,
+    usuario: Usuario = Depends(get_user_by_api_key),
+    session: Session = Depends(get_session),
+):
+    """Inutiliza o nNF de UMA nota rejeitada/pendente na SEFAZ — destrava a fila.
+
+    ÚLTIMO RECURSO. A preferência é sempre reenviar com correção (`POST /reenviar/
+    {id}` reusa o mesmo nNF). Só use inutilizar quando o operador DESISTIR da
+    venda rejeitada — a inutilização gera lastro fiscal permanente na SEFAZ.
+
+    Aceita: `rejeitada` (SEFAZ rejeitou explicitamente) ou `pendente_consulta`
+    (timeout, mas o operador não quer arriscar reenviar). NÃO aceita autorizada
+    (isso é cancelamento), denegada (nNF já consumido, nada a inutilizar) ou
+    inutilizada (já inutilizada).
+
+    Após sucesso, a fila destrava (status vira `inutilizada`, sai do
+    `STATUS_BLOQUEIA_FILA`).
+    """
+    nota = _carregar_nota_do_usuario(nota_id, usuario, session)
+
+    if nota.status not in ("rejeitada", "pendente_consulta"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Só notas 'rejeitada' ou 'pendente_consulta' podem ser inutilizadas. "
+                f"Status atual: '{nota.status}'."
+            ),
+        )
+    if nota.numero is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Nota sem número reservado — nada a inutilizar na SEFAZ.",
+        )
+    if nota.empresa_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Nota sem empresa vinculada — impossível inutilizar (sem CNPJ).",
+        )
+
+    empresa = session.get(Empresa, nota.empresa_id)
+    if not empresa or empresa.usuario_id != usuario.id:
+        raise HTTPException(status_code=404, detail="Empresa da nota não encontrada.")
+
+    modelo_int = 55 if nota.modelo == "55" else 65
+    ano = (nota.criado_em or datetime.utcnow()).year
+
+    acbr = ACBrAPIService()
+    ok, resposta = await acbr.inutilizar_faixa(
+        cnpj=empresa.cnpj,
+        ano=ano,
+        serie=nota.serie or 1,
+        numero_inicial=nota.numero,
+        numero_final=nota.numero,
+        justificativa=body.justificativa,
+        modelo=modelo_int,
+    )
+
+    if not ok:
+        aut = resposta.get("autorizacao") or {}
+        err = resposta.get("error") or {}
+        motivo = (
+            aut.get("motivo_status")
+            or resposta.get("motivo_status")
+            or err.get("message")
+            or resposta.get("erro")
+            or "Rejeição desconhecida"
+        )
+        cstat = aut.get("codigo_status") or resposta.get("codigo_status") or err.get("code")
+        prefixo = f"cStat {cstat}: " if cstat else ""
+        raise HTTPException(
+            status_code=400,
+            detail=f"SEFAZ recusou inutilização: {prefixo}{motivo}",
+        )
+
+    nota.status = "inutilizada"
+    nota.resposta_integradora = json.dumps(resposta)
+    nota.atualizado_em = datetime.utcnow()
+    session.add(nota)
+    session.commit()
+    session.refresh(nota)
+
+    return {
+        "sucesso": True,
+        "nota_id": nota.id,
+        "numero_inutilizado": nota.numero,
+        "modelo": nota.modelo,
+        "serie": nota.serie,
+        "resposta_sefaz": resposta,
+    }
+
 
 @router.get("/rascunhos", response_model=List[NotaResponse])
 async def listar_rascunhos(

@@ -1431,8 +1431,25 @@ class ACBrAPIService:
             body = {"raw": r.text}
         return False, {"status_code": r.status_code, **body}
 
-    async def baixar_pdf(self, documento_id: str, modelo: int = 65) -> Tuple[bool, Union[bytes, Dict[str, Any]]]:
-        """Baixa o PDF (DANFE) da NFC-e (modelo 65) ou NF-e (modelo 55). Recebe o id interno ACBr (nfc_xxx/nfe_xxx)."""
+    async def baixar_pdf(
+        self,
+        documento_id: str,
+        modelo: int = 65,
+        *,
+        resumido: bool = False,
+        logotipo: bool = True,
+        nome_fantasia: bool = True,
+        qrcode_lateral: bool = False,
+        largura: int = 80,
+        mensagem_rodape: str = "",
+    ) -> Tuple[bool, Union[bytes, Dict[str, Any]]]:
+        """Baixa o PDF (DANFE) da NFC-e (modelo 65) ou NF-e (modelo 55). Recebe o id interno ACBr (nfc_xxx/nfe_xxx).
+
+        Query params NFC-e (ACBr API GET /nfce/{id}/pdf):
+        - resumido=false → DANFE completo COM itens (default). true = ecológico sem itens.
+        - logotipo/nome_fantasia — passados explícitos pra não depender do default remoto.
+        Params ignorados em modelo 55 (DANFE NF-e é fixo).
+        """
         try:
             token = await self._get_access_token()
         except Exception as e:
@@ -1440,9 +1457,20 @@ class ACBrAPIService:
         recurso = "nfce" if modelo == 65 else "nfe"
         url = f"{self.base_url}/{recurso}/{documento_id}/pdf"
         headers = {"Authorization": f"Bearer {token}"}
+        params: Dict[str, Any] = {}
+        if modelo == 65:
+            params = {
+                "resumido": str(resumido).lower(),
+                "logotipo": str(logotipo).lower(),
+                "nome_fantasia": str(nome_fantasia).lower(),
+                "qrcode_lateral": str(qrcode_lateral).lower(),
+                "largura": largura,
+            }
+            if mensagem_rodape:
+                params["mensagem_rodape"] = mensagem_rodape
         try:
             async with httpx.AsyncClient() as client:
-                r = await client.get(url, headers=headers, timeout=20.0)
+                r = await client.get(url, headers=headers, params=params, timeout=20.0)
         except Exception as e:
             return False, {"erro": str(e)}
         if r.status_code == 200:

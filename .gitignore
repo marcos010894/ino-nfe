@@ -53,3 +53,9 @@ build/
 
 # --- Docs temporários ---
 documentacao-para-innosystem/.build.html
+
+# --- Backups locais com dados fiscais reais (CPF, chave, valores) ---
+bkp/
+
+# --- Dúvidas / material do cliente (PII) ---
+duvidas_christian/

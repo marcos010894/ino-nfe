@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { FileText, Download, XOctagon, RefreshCw, AlertCircle, ShieldCheck, HelpCircle, Eye, Loader2 } from 'lucide-react';
+import { FileText, Download, XOctagon, RefreshCw, AlertCircle, ShieldCheck, HelpCircle, Eye, Loader2, Ban, Clock, ShieldX, Search } from 'lucide-react';
 import api from '../../lib/api';
 
 interface Nota {
@@ -99,6 +99,40 @@ export default function CentralDocumentos() {
       alert("Erro ao consultar o status da nota na SEFAZ.");
     } finally {
       setConsultandoId(null);
+    }
+  };
+
+  // Inutilização por id — último recurso pra destravar a fila quando operador
+  // desiste da venda rejeitada/pendente. Gera lastro fiscal permanente na SEFAZ.
+  const [notaSelecionadaInutilizar, setNotaSelecionadaInutilizar] = useState<Nota | null>(null);
+  const [justificativaInutilizar, setJustificativaInutilizar] = useState<string>('');
+  const [inutilizando, setInutilizando] = useState<boolean>(false);
+  const [erroInutilizar, setErroInutilizar] = useState<string>('');
+
+  const abrirModalInutilizar = (nota: Nota) => {
+    setNotaSelecionadaInutilizar(nota);
+    setJustificativaInutilizar('');
+    setErroInutilizar('');
+  };
+
+  const executarInutilizacao = async () => {
+    if (!notaSelecionadaInutilizar) return;
+    if (justificativaInutilizar.length < 15) {
+      setErroInutilizar("A justificativa deve ter no mínimo 15 caracteres.");
+      return;
+    }
+    setInutilizando(true);
+    setErroInutilizar('');
+    try {
+      await api.post(`/empresas/${empresaSelecionada}/notas/${notaSelecionadaInutilizar.id}/inutilizar`, {
+        justificativa: justificativaInutilizar,
+      });
+      setNotaSelecionadaInutilizar(null);
+      carregarNotas();
+    } catch (err: any) {
+      setErroInutilizar(err.response?.data?.detail || "Erro ao inutilizar a nota na SEFAZ.");
+    } finally {
+      setInutilizando(false);
     }
   };
 
@@ -261,6 +295,15 @@ export default function CentralDocumentos() {
         return <span className="px-2 py-1 text-xs font-bold text-warn bg-warn-tint rounded-full flex items-center gap-1 w-max"><AlertCircle size={12} /> Rejeitada</span>;
       case 'cancelada':
         return <span className="px-2 py-1 text-xs font-bold text-muted bg-line-soft rounded-full flex items-center gap-1 w-max"><XOctagon size={12} /> Cancelada</span>;
+      case 'pendente_consulta':
+        // Timeout SEFAZ — destino incerto. Amber alerta o operador que trava a fila até resolver.
+        return <span className="px-2 py-1 text-xs font-bold text-[#8a6d0b] bg-[#fdf5d3] border border-[#f0dc80] rounded-full flex items-center gap-1 w-max"><Clock size={12} /> Pendente Consulta</span>;
+      case 'denegada':
+        // SEFAZ consumiu nNF mas negou (cStat 110/301/302). Vermelho escuro, sem opção de reenviar.
+        return <span className="px-2 py-1 text-xs font-bold text-white bg-[#8f2c22] rounded-full flex items-center gap-1 w-max"><ShieldX size={12} /> Denegada</span>;
+      case 'inutilizada':
+        // nNF queimado formalmente — cinza forte, ação final.
+        return <span className="px-2 py-1 text-xs font-bold text-white bg-ink rounded-full flex items-center gap-1 w-max"><Ban size={12} /> Inutilizada</span>;
       default:
         return <span className="px-2 py-1 text-xs font-bold text-ink-soft bg-field border border-line rounded-full flex items-center gap-1 w-max"><RefreshCw size={12} className="animate-spin" /> Processando</span>;
     }
@@ -313,6 +356,9 @@ export default function CentralDocumentos() {
             <option value="">Todos os Status</option>
             <option value="autorizada">Autorizada</option>
             <option value="rejeitada">Rejeitada</option>
+            <option value="pendente_consulta">Pendente Consulta</option>
+            <option value="denegada">Denegada</option>
+            <option value="inutilizada">Inutilizada</option>
             <option value="cancelada">Cancelada</option>
             <option value="processando">Processando</option>
           </select>
@@ -415,17 +461,68 @@ export default function CentralDocumentos() {
                           <button
                             onClick={() => abrirModalReprocessar(nota)}
                             className="bg-i9 hover:opacity-90 text-white font-bold text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 transition-opacity shadow-sm"
+                            title="Corrigir e retransmitir (reusa o mesmo nNF)"
                           >
                             <RefreshCw size={12} />
                             Reprocessar
                           </button>
-                          <button 
-                            className="text-warn cursor-help p-1" 
+                          <button
+                            onClick={() => abrirModalInutilizar(nota)}
+                            className="text-ink-soft hover:bg-line-soft border border-line font-bold text-xs px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-colors"
+                            title="Último recurso: queima esse nNF na SEFAZ e destrava a fila (operador desistiu da venda)"
+                          >
+                            <Ban size={12} />
+                            Inutilizar
+                          </button>
+                          <button
+                            className="text-warn cursor-help p-1"
                             title={extrairMotivoErro(nota)}
                           >
                             <HelpCircle size={15} />
                           </button>
                         </div>
+                      )}
+
+                      {nota.status === 'pendente_consulta' && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => consultarStatus(nota.id)}
+                            disabled={consultandoId === nota.id}
+                            className="bg-i9 hover:opacity-90 text-white font-bold text-xs px-3 py-1.5 rounded-lg flex items-center gap-1 transition-opacity shadow-sm disabled:opacity-50"
+                            title="Pergunta à SEFAZ o veredito real dessa nota"
+                          >
+                            <Search size={12} className={consultandoId === nota.id ? "animate-spin" : ""} />
+                            {consultandoId === nota.id ? "Consultando..." : "Consultar SEFAZ"}
+                          </button>
+                          <button
+                            onClick={() => abrirModalInutilizar(nota)}
+                            className="text-ink-soft hover:bg-line-soft border border-line font-bold text-xs px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-colors"
+                            title="Último recurso: se operador desiste da venda"
+                          >
+                            <Ban size={12} />
+                            Inutilizar
+                          </button>
+                        </div>
+                      )}
+
+                      {nota.status === 'denegada' && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] font-semibold text-muted italic">
+                            nNF consumido — sem reenvio
+                          </span>
+                          <button
+                            className="text-[#8f2c22] cursor-help p-1"
+                            title={`SEFAZ denegou o uso desse número (cStat 110/301/302). ${extrairMotivoErro(nota)}`}
+                          >
+                            <HelpCircle size={15} />
+                          </button>
+                        </div>
+                      )}
+
+                      {nota.status === 'inutilizada' && (
+                        <span className="text-[10px] font-semibold text-muted italic">
+                          Nº queimado na SEFAZ
+                        </span>
                       )}
 
                       {nota.status === 'processando' && (
@@ -566,6 +663,82 @@ export default function CentralDocumentos() {
           </div>
         </div>
       )}
+      {/* Modal Inutilizar (último recurso — gera lastro fiscal permanente) */}
+      {notaSelecionadaInutilizar && (
+        <div className="fixed inset-0 bg-ink/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-card border border-line rounded-xl shadow-lg max-w-md w-full p-6 flex flex-col gap-4 animate-in fade-in-50 zoom-in-95 duration-150">
+            <div>
+              <h3 className="text-lg font-extrabold text-ink flex items-center gap-2">
+                <Ban size={18} className="text-[#8f2c22]" />
+                Inutilizar Numeração
+              </h3>
+              <p className="text-xs text-muted mt-1">
+                Nota Nº <span className="font-mono font-bold">{notaSelecionadaInutilizar.numero}</span> · Série {notaSelecionadaInutilizar.serie} · Modelo {notaSelecionadaInutilizar.modelo === '65' ? 'NFC-e' : 'NF-e'}
+              </p>
+            </div>
+
+            {/* Aviso de irreversibilidade */}
+            <div className="bg-warn-tint border border-[#f0c9c4] text-warn p-3 rounded-lg text-xs flex items-start gap-2">
+              <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
+              <div className="flex flex-col gap-1">
+                <span className="font-bold">Ação irreversível.</span>
+                <span>
+                  Isso declara à SEFAZ que o número <strong>{notaSelecionadaInutilizar.numero}</strong> foi queimado sem virar documento fiscal.
+                  Só use se o operador <strong>desistiu da venda</strong> — a preferência é sempre corrigir e reenviar (mesmo nNF).
+                </span>
+              </div>
+            </div>
+
+            {erroInutilizar && (
+              <div className="bg-warn-tint border border-[#f0c9c4] text-warn p-3 rounded-lg text-xs font-semibold">
+                {erroInutilizar}
+              </div>
+            )}
+
+            <div className="flex flex-col gap-1.5">
+              <label className="text-xs font-bold text-muted uppercase">Justificativa *</label>
+              <textarea
+                value={justificativaInutilizar}
+                onChange={(e) => setJustificativaInutilizar(e.target.value)}
+                placeholder="Motivo real da inutilização (mínimo 15 caracteres)..."
+                rows={3}
+                className="bg-field border border-line rounded-lg p-2.5 text-xs focus:border-i9 outline-none resize-none text-ink-soft"
+              />
+              <span className="text-[10px] text-muted text-right">
+                {justificativaInutilizar.length}/15 caracteres necessários
+              </span>
+            </div>
+
+            <div className="flex justify-end gap-2 border-t border-line-soft pt-4 mt-1">
+              <button
+                onClick={() => setNotaSelecionadaInutilizar(null)}
+                className="px-4 py-2 text-xs font-bold text-ink-soft bg-field border border-line rounded-lg hover:bg-line-soft transition-colors"
+                disabled={inutilizando}
+              >
+                Voltar
+              </button>
+              <button
+                onClick={executarInutilizacao}
+                className="px-4 py-2 text-xs font-bold text-white bg-[#8f2c22] rounded-lg hover:opacity-90 transition-opacity disabled:opacity-50 flex items-center gap-1.5"
+                disabled={inutilizando || justificativaInutilizar.length < 15}
+              >
+                {inutilizando ? (
+                  <>
+                    <Loader2 size={12} className="animate-spin" />
+                    Inutilizando...
+                  </>
+                ) : (
+                  <>
+                    <Ban size={12} />
+                    Confirmar Inutilização
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Modal Exportar em Lote */}
       {showExportModal && (
         <div className="fixed inset-0 bg-ink/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">

@@ -230,8 +230,11 @@ async def criar_e_transmitir_nota(
     if status == "autorizada":
         nova_nota.acbr_id = resposta.get("id")
         nova_nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso")
-        nova_nota.numero = resposta.get("numero") or resposta.get("numeroNota")
-        nova_nota.serie = resposta.get("serie")
+        # Fallback pro proximo_numero/SERIE_PADRAO: se ACBr não devolve numero/serie
+        # no top-level da resposta autorizada, a nota fica com numero=None e some do
+        # MAX(numero)+1 — a próxima emissão propõe o mesmo nNF de novo (bug produção).
+        nova_nota.numero = resposta.get("numero") or resposta.get("numeroNota") or proximo_numero
+        nova_nota.serie = resposta.get("serie") or SERIE_PADRAO
         # Reconciliar o campo `modelo` da nota com o prefixo do id da ACBr — fonte de verdade
         # é a rota que a ACBr efetivamente processou, não o valor que o cliente pediu.
         if nova_nota.acbr_id:
@@ -1011,18 +1014,60 @@ async def reprocessar_nota(
     v_desc = float(venda_data.get("desconto", 0.0))
     valor_total = round(v_prod - v_desc, 2)
 
-    # 3. Montar novo payload
+    # 3. Reservar próximo nNF/serie pelo cadastro atual da empresa — MESMO padrão
+    # do POST /emitir (linhas 127-171). Bug histórico: essa rota chamava
+    # `montar_payload_nfce(empresa, regra, venda_data)` sem numero/serie, caindo
+    # em serie=1 default + nNF random.randint(1,999999) — reprocessou numa NFC-e
+    # prod (id=113 nNF=160794 serie=1, cancelada em 2026-09-07).
+    modelo_int = int(nota.modelo)
+    SERIE_PADRAO = empresa.serie_nfe if modelo_int == 55 else empresa.serie_nfce
+    ultimo_numero = session.exec(
+        select(Nota.numero)
+        .where(
+            Nota.empresa_id == empresa_id,
+            Nota.modelo == str(modelo_int),
+            Nota.serie == SERIE_PADRAO,
+            Nota.numero.is_not(None),
+            Nota.id != nota.id,  # não conta ela mesma (rejeitada não queima nNF)
+        )
+        .order_by(Nota.numero.desc())
+    ).first()
+    inicial_forcado = (empresa.proximo_nnf_inicial_nfe if modelo_int == 55
+                       else empresa.proximo_nnf_inicial_nfce)
+    consumiu_inicial = False
+    if nota_in.numero_override:
+        proximo_numero = nota_in.numero_override
+    elif inicial_forcado:
+        proximo_numero = inicial_forcado
+        consumiu_inicial = True
+    elif ultimo_numero:
+        proximo_numero = ultimo_numero + 1
+    else:
+        proximo_numero = 1
+    if consumiu_inicial:
+        if modelo_int == 55:
+            empresa.proximo_nnf_inicial_nfe = None
+        else:
+            empresa.proximo_nnf_inicial_nfce = None
+        session.add(empresa)
+
+    # 4. Montar novo payload passando numero/serie explícitos
     acbr_service = ACBrAPIService()
     try:
-        payload = acbr_service.montar_payload_nfce(empresa, regra, venda_data)
+        payload = acbr_service.montar_payload_nfce(
+            empresa, regra, venda_data,
+            modelo=modelo_int, numero=proximo_numero, serie=SERIE_PADRAO,
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao gerar payload fiscal: {str(e)}")
 
-    # 4. Atualizar registro da nota para reprocessando
+    # 5. Atualizar registro da nota para reprocessando (queima nNF/serie antes do send)
     nota.status = "processando"
     nota.valor_total = valor_total
     nota.json_venda = nota_in.json_venda
     nota.payload_enviado = json.dumps(payload)
+    nota.numero = proximo_numero
+    nota.serie = SERIE_PADRAO
     nota.atualizado_em = datetime.utcnow()
     session.add(nota)
     session.commit()
@@ -1038,8 +1083,9 @@ async def reprocessar_nota(
     if status == "autorizada":
         nota.acbr_id = resposta.get("id")
         nota.chave_acesso = resposta.get("chave") or resposta.get("chaveAcesso")
-        nota.numero = resposta.get("numero") or resposta.get("numeroNota")
-        nota.serie = resposta.get("serie")
+        # Fallback pro proximo_numero/SERIE_PADRAO — mesmo pattern do /emitir.
+        nota.numero = resposta.get("numero") or resposta.get("numeroNota") or proximo_numero
+        nota.serie = resposta.get("serie") or SERIE_PADRAO
         nota.pdf_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nota.id}/pdf"
         nota.xml_url = f"http://localhost:8000/empresas/{empresa_id}/notas/{nota.id}/xml"
     else:

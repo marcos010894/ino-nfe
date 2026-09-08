@@ -241,8 +241,38 @@ export default function RegraFiscalForm() {
               </div>
               <div className="flex flex-col gap-1.5">
                 <label className={labelClass}>NCM Padrão *</label>
-                <input name="ncm_padrao" value={formData.ncm_padrao} onChange={handleChange} required minLength={8} maxLength={8} placeholder="Ex: 71131900" className={inputMonoClass} />
-                <span className="text-[10px] text-muted">Apenas números (8 dígitos)</span>
+                <input
+                  name="ncm_padrao"
+                  value={formData.ncm_padrao}
+                  onChange={handleChange}
+                  required
+                  minLength={8}
+                  maxLength={8}
+                  placeholder="Ex: 71131900"
+                  list="ncm-sugestoes"
+                  className={inputMonoClass}
+                />
+                {/* Sugestões de NCM comuns pra varejo. O input continua livre — o
+                    datalist só ajuda o operador a achar o código. Fallback quando
+                    o InnoSystem não manda `ncm` por item na venda. */}
+                <datalist id="ncm-sugestoes">
+                  <option value="71131900">Joias de ouro / outros metais preciosos</option>
+                  <option value="71131100">Joias de prata</option>
+                  <option value="71132000">Semijoias (metal comum folheado / plaquê)</option>
+                  <option value="71171900">Bijuterias de metal comum</option>
+                  <option value="71179000">Bijuterias (outras)</option>
+                  <option value="91011100">Relógios de pulso — caixa metal precioso</option>
+                  <option value="91021100">Relógios de pulso — outros</option>
+                  <option value="85171300">Smartphones</option>
+                  <option value="85171400">Celulares (outros)</option>
+                  <option value="85176294">Fones de ouvido / headsets</option>
+                  <option value="84713012">Tablets</option>
+                  <option value="85444200">Cabos USB / dados</option>
+                  <option value="85287200">Televisores</option>
+                  <option value="42021200">Bolsas / carteiras (material sintético)</option>
+                  <option value="61091000">Camisetas / t-shirts (algodão)</option>
+                </datalist>
+                <span className="text-[10px] text-muted">Apenas números (8 dígitos). Clique no campo pra ver sugestões comuns.</span>
               </div>
               <div className="flex flex-col gap-1.5">
                 <label className={labelClass}>CEST</label>

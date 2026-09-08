@@ -138,6 +138,7 @@ Depois do POST, o rascunho aparece na tela **Notas Recebidas** do InnoFiscal —
 | `quantidade`     | number  | sim    | > 0, aceita decimal           |
 | `valor_unitario` | number  | sim    | Em reais, aceita decimal      |
 | `unidade`        | string  | sim    | `UN`, `PR`, `KG`, `CX`, etc.  |
+| `ncm`            | string  | não    | 8 dígitos (`"71131900"` ou `"7113.19.00"`). Se omitido, usa o `ncm_padrao` da regra fiscal da empresa. |
 
 **`desconto`** (opcional, default `0`) — valor em reais aplicado no total (não é %).
 
