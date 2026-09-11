@@ -506,12 +506,16 @@ class ACBrAPIService:
             float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0))
             for item in itens_venda
         )
-        # Contrato atual InnoSystem: `valor_unitario` já vem LÍQUIDO (desconto
-        # embutido no unit). O campo `venda.desconto` é enviado como legado mas
-        # não deve ser subtraído — senão dá dupla-subtração (cStat 866 histórico).
-        # Ignoramos deliberadamente: v_desc = 0. Nada de rateio, nada de vDesc.
-        v_desc = 0.0
-        v_nf_base = _r(v_prod)
+        # Contrato InnoSystem: `valor_unitario` vem BRUTO + `venda.desconto`
+        # agregado no topo. Rateio item-a-item calculado abaixo pra fechar
+        # cStat 537 (soma dos vDesc dos itens == vDesc total).
+        # NOTA: um fix experimental (commit c007120, 2026-09-11) forçou v_desc=0
+        # assumindo unit líquido — foi RETIRADO. A rascunho da Elma provou que
+        # unit continua bruto: Σ(unit) = R$440,70, desconto = R$237,30, total
+        # esperado = R$203,40, pagamento = R$440,70. Emitir sem subtrair
+        # inflaria a nota em 2x.
+        v_desc = float(venda.get("desconto", 0.0))
+        v_nf_base = _r(v_prod - v_desc)
 
         # Rateio do desconto total entre os itens (proporcional ao vProd).
         # A SEFAZ rejeita (cStat 537) se sum(item.vDesc) != total.vDesc.
