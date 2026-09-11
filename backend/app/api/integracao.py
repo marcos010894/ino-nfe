@@ -302,8 +302,10 @@ async def receber_venda_externa(
 
     _verificar_pendencia_fila_fiscal(usuario, session)
 
-    subtotal = sum(item.quantidade * item.valor_unitario for item in payload.itens)
-    valor_total = subtotal - payload.desconto
+    # Unit já vem LÍQUIDO do InnoSystem (contrato 2026-09-11) — `desconto` no
+    # topo é decorativo, não subtrai. Total = Σ(qty × unit). Ver detalhes em
+    # `montar_payload_nfce` (acbr_api.py:509).
+    valor_total = sum(item.quantidade * item.valor_unitario for item in payload.itens)
 
     nova_nota = Nota(
         usuario_id=usuario.id,
@@ -386,10 +388,12 @@ async def reenviar_nota_via_integracao(
         raise HTTPException(status_code=400, detail="Nenhuma regra fiscal cadastrada para a empresa.")
 
     # 4. Substituir json_venda pelo payload corrigido + recalcular total
+    #    Unit já é LÍQUIDO — não subtrai desconto (ver integracao.py:305).
     venda_data = payload.model_dump()
-    v_prod = sum(float(it.get("quantidade", 0)) * float(it.get("valor_unitario", 0)) for it in venda_data.get("itens", []))
-    v_desc = float(venda_data.get("desconto", 0.0))
-    valor_total = round(v_prod - v_desc, 2)
+    valor_total = round(
+        sum(float(it.get("quantidade", 0)) * float(it.get("valor_unitario", 0)) for it in venda_data.get("itens", [])),
+        2,
+    )
 
     # 5. Montar payload ACBr — REUSA nNF/serie da nota original
     modelo_int = int(nota.modelo) if nota.modelo else 65

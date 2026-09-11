@@ -375,18 +375,32 @@ export default function EmitirNota() {
                   ))}
                 </div>
 
-                {/* Totais */}
-                <div className="py-4 space-y-1.5">
-                  <LinhaTotal rotulo="Soma dos produtos" valor={rascunho.valor_total + Number(venda.desconto || 0)} />
-                  <LinhaTotal rotulo="Desconto" valor={Number(venda.desconto || 0)} />
-                  {(venda.pagamentos || []).map((p: any, i: number) => (
-                    <LinhaTotal key={i} rotulo={`Pagamento · ${labelPagamento(p.meio_pagamento)}`} valor={Number(p.valor || 0)} />
-                  ))}
-                  <div className="flex justify-between items-baseline pt-3 border-t-2 border-ink mt-2">
-                    <span className="font-extrabold text-base">Total da nota</span>
-                    <b className="text-3xl font-extrabold tracking-tight">R$ {fmtMoeda(rascunho.valor_total)}</b>
-                  </div>
-                </div>
+                {/* Totais — unit já vem LÍQUIDO do InnoSystem, desconto é decorativo */}
+                {(() => {
+                  const somaItens = (venda.itens || []).reduce(
+                    (s: number, it: any) => s + Number(it.quantidade || 0) * Number(it.valor_unitario || 0),
+                    0
+                  );
+                  const descontoInfo = Number(venda.desconto || 0);
+                  return (
+                    <div className="py-4 space-y-1.5">
+                      <LinhaTotal rotulo="Soma dos produtos" valor={somaItens} />
+                      {descontoInfo > 0 && (
+                        <div className="flex justify-between text-xs text-muted">
+                          <span>Desconto (informativo — já aplicado nos preços)</span>
+                          <span>R$ {fmtMoeda(descontoInfo)}</span>
+                        </div>
+                      )}
+                      {(venda.pagamentos || []).map((p: any, i: number) => (
+                        <LinhaTotal key={i} rotulo={`Pagamento · ${labelPagamento(p.meio_pagamento)}`} valor={Number(p.valor || 0)} />
+                      ))}
+                      <div className="flex justify-between items-baseline pt-3 border-t-2 border-ink mt-2">
+                        <span className="font-extrabold text-base">Total da nota</span>
+                        <b className="text-3xl font-extrabold tracking-tight">R$ {fmtMoeda(somaItens)}</b>
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* Botões */}
                 <div className="grid grid-cols-1 sm:grid-cols-[1.35fr_1fr] gap-3 mt-5">
@@ -872,15 +886,17 @@ function PreviewArea({ autorizada, nota, empresa, venda, valorTotal }: any) {
 }
 
 // -------------- Cupom NFC-e (estilo térmico) --------------
-function CupomNFCePreview({ autorizada, nota, empresa, venda, valorTotal }: any) {
+function CupomNFCePreview({ autorizada, nota, empresa, venda }: any) {
   const nomeEmp = (empresa?.nome_fantasia || empresa?.razao_social || 'EMPRESA').toString().toUpperCase();
   const cnpj = empresa?.cnpj || '—';
   const endereco = [empresa?.logradouro, empresa?.numero].filter(Boolean).join(', ');
   const cidade = [empresa?.cidade, empresa?.uf].filter(Boolean).join('/');
   const itens = (venda?.itens || []) as any[];
-  const desconto = Number(venda?.desconto || 0);
   const pagamentos = (venda?.pagamentos || []) as any[];
-  const subtotal = valorTotal + desconto;
+  // Unit vem LÍQUIDO — subtotal = total = Σ(qty × unit). Desconto é decorativo,
+  // não sai no cupom fiscal (sairia como -vDesc, mas emissão manda vDesc=0).
+  const subtotal = itens.reduce((s, it) => s + Number(it.quantidade || 0) * Number(it.valor_unitario || 0), 0);
+  const valorTotal = subtotal;
   const cliente = venda?.cliente;
 
   return (
@@ -931,7 +947,6 @@ function CupomNFCePreview({ autorizada, nota, empresa, venda, valorTotal }: any)
       <div className="py-2 text-[11px]">
         <div className="flex justify-between"><span>Qtd. total de itens</span><span>{itens.length}</span></div>
         <div className="flex justify-between"><span>Subtotal</span><span>R$ {fmtMoeda(subtotal)}</span></div>
-        {desconto > 0 && <div className="flex justify-between"><span>Desconto</span><span>-{fmtMoeda(desconto)}</span></div>}
         <div className="flex justify-between font-bold text-[14px] pt-1 mt-1 border-t border-dashed border-[#C9C5BA]">
           <span>TOTAL R$</span><span>{fmtMoeda(valorTotal)}</span>
         </div>
@@ -986,12 +1001,13 @@ function CupomNFCePreview({ autorizada, nota, empresa, venda, valorTotal }: any)
 }
 
 // -------------- DANFE NF-e mod 55 (simplificado) --------------
-function DanfePreview({ autorizada, nota, empresa, venda, valorTotal }: any) {
+function DanfePreview({ autorizada, nota, empresa, venda }: any) {
   const cliente = venda?.cliente;
   const end = cliente?.endereco || {};
   const itens = (venda?.itens || []) as any[];
-  const desconto = Number(venda?.desconto || 0);
-  const subtotal = valorTotal + desconto;
+  // Unit LÍQUIDO — subtotal = total = Σ itens; desconto decorativo não vai no DANFE
+  const subtotal = itens.reduce((s, it) => s + Number(it.quantidade || 0) * Number(it.valor_unitario || 0), 0);
+  const valorTotal = subtotal;
   const chave = nota?.chave_acesso || '';
 
   return (
@@ -1074,7 +1090,7 @@ function DanfePreview({ autorizada, nota, empresa, venda, valorTotal }: any) {
         <BoxDanfe rot="Base de cálculo ICMS" val="0,00" />
         <BoxDanfe rot="Valor do ICMS" val="0,00" />
         <BoxDanfe rot="Valor dos produtos" val={fmtMoeda(subtotal)} />
-        <BoxDanfe rot="Desconto" val={fmtMoeda(desconto)} />
+        <BoxDanfe rot="Desconto" val="0,00" />
       </div>
       <div className="grid grid-cols-4 gap-0.5 mt-0.5">
         <BoxDanfe rot="Valor do frete" val="0,00" />

@@ -506,16 +506,15 @@ class ACBrAPIService:
             float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0))
             for item in itens_venda
         )
-        # Contrato InnoSystem: `valor_unitario` vem BRUTO + `venda.desconto`
-        # agregado no topo. Rateio item-a-item calculado abaixo pra fechar
-        # cStat 537 (soma dos vDesc dos itens == vDesc total).
-        # NOTA: um fix experimental (commit c007120, 2026-09-11) forçou v_desc=0
-        # assumindo unit líquido — foi RETIRADO. A rascunho da Elma provou que
-        # unit continua bruto: Σ(unit) = R$440,70, desconto = R$237,30, total
-        # esperado = R$203,40, pagamento = R$440,70. Emitir sem subtrair
-        # inflaria a nota em 2x.
-        v_desc = float(venda.get("desconto", 0.0))
-        v_nf_base = _r(v_prod - v_desc)
+        # Contrato InnoSystem (validado com dono 2026-09-11, venda #129 Elma):
+        # `valor_unitario` vem LÍQUIDO (com desconto já embutido) e `desconto`
+        # no topo é DECORATIVO (o "de R$X por R$Y" da promo — nunca subtrair).
+        # Prova: Σ(unit×qty) = 440,70, pagamento = 440,70 → sum bate com pag,
+        # então unit é o valor final. Emitir 440,70 na SEFAZ, sem vDesc.
+        # Se subtrair o `desconto`, emitiria 203,40 — nota subdeclarada em 2×,
+        # que é o que aconteceu no flip-flop b9c3012 (revertido logo depois).
+        v_desc = 0.0
+        v_nf_base = _r(v_prod)
 
         # Rateio do desconto total entre os itens (proporcional ao vProd).
         # A SEFAZ rejeita (cStat 537) se sum(item.vDesc) != total.vDesc.
