@@ -439,21 +439,29 @@ class ACBrAPIService:
         v_ibs_uf = _r(base * (p_ibs_uf / 100.0))
         v_ibs_mun = _r(base * (p_ibs_mun / 100.0))
 
-        grp: Dict[str, Any] = {
-            "CST": cst or "000",
-            "cClassTrib": cclass or "000000",
+        # NT 2024.002: IBSCBS wrapper só aceita CST/cClassTrib + subgrupo gIBSCBS.
+        # DTO ACBr TTribNFe rejeita vBC direto (InvalidJsonProperty). Miolo trib
+        # (vBC, gIBSUF, gIBSMun, vIBS, gCBS + opcionais Mono/CredPres/Dif) fica
+        # dentro. `vIBS` = vIBSUF + vIBSMun (total IBS) — obrigatório pelo layout.
+        v_ibs_total = _r(v_ibs_uf + v_ibs_mun)
+        gibscbs: Dict[str, Any] = {
             "vBC": base,
             "gIBSUF": {"pIBSUF": p_ibs_uf, "vIBSUF": v_ibs_uf},
             "gIBSMun": {"pIBSMun": p_ibs_mun, "vIBSMun": v_ibs_mun},
+            "vIBS": v_ibs_total,
             "gCBS": {"pCBS": p_cbs, "vCBS": v_cbs},
         }
         if regra.regime_monofasico:
-            grp["gIBSCBSMono"] = {"pRFBCBS": p_cbs, "vRFBCBS": v_cbs}
+            gibscbs["gIBSCBSMono"] = {"pRFBCBS": p_cbs, "vRFBCBS": v_cbs}
         if regra.credito_presumido:
-            grp["gIBSCredPres"] = {"cCredPres": "01", "pCredPres": 0.0, "vCredPres": 0.0}
+            gibscbs["gIBSCredPres"] = {"cCredPres": "01", "pCredPres": 0.0, "vCredPres": 0.0}
         if regra.diferimento:
-            grp["gIBSCBSDif"] = {"cBenefDif": "0", "pDif": 100.0, "vDif": v_cbs + v_ibs_uf + v_ibs_mun}
-        return grp
+            gibscbs["gIBSCBSDif"] = {"cBenefDif": "0", "pDif": 100.0, "vDif": v_cbs + v_ibs_uf + v_ibs_mun}
+        return {
+            "CST": cst or "000",
+            "cClassTrib": cclass or "000000",
+            "gIBSCBS": gibscbs,
+        }
 
     def _resolver_is(self, regra: RegraFiscal, valor_item: float) -> Optional[Dict[str, Any]]:
         """Imposto Seletivo (IS). Omitido se não configurado."""
@@ -464,6 +472,19 @@ class ACBrAPIService:
         base = _r(valor_item)
         v_is = _r(base * (aliquota / 100.0))
         return {"CST": cst or "000", "vBC": base, "pIS": aliquota, "vIS": v_is}
+
+    def _montar_pag(self, det_pag: list, soma_v_pag: float, v_nf: float) -> Dict[str, Any]:
+        """Bloco `pag` com vTroco automático quando soma(vPag) > vNF.
+
+        SEFAZ rejeita (cStat 623) se soma dos pagamentos difere do total da nota
+        sem `vTroco` compensando. Caso típico: cliente paga R$50 em dinheiro numa
+        nota de R$36 e recebe R$14 de troco.
+        """
+        pag: Dict[str, Any] = {"detPag": det_pag}
+        troco = _r(soma_v_pag - v_nf)
+        if troco > 0.0:
+            pag["vTroco"] = troco
+        return pag
 
     # ------------------------------------------------------------------
     # Montagem do payload NF-e / NFC-e
@@ -485,8 +506,12 @@ class ACBrAPIService:
             float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0))
             for item in itens_venda
         )
-        v_desc = float(venda.get("desconto", 0.0))
-        v_nf_base = _r(v_prod - v_desc)
+        # Contrato atual InnoSystem: `valor_unitario` já vem LÍQUIDO (desconto
+        # embutido no unit). O campo `venda.desconto` é enviado como legado mas
+        # não deve ser subtraído — senão dá dupla-subtração (cStat 866 histórico).
+        # Ignoramos deliberadamente: v_desc = 0. Nada de rateio, nada de vDesc.
+        v_desc = 0.0
+        v_nf_base = _r(v_prod)
 
         # Rateio do desconto total entre os itens (proporcional ao vProd).
         # A SEFAZ rejeita (cStat 537) se sum(item.vDesc) != total.vDesc.
@@ -619,9 +644,10 @@ class ACBrAPIService:
             if ii:
                 tot_v_ii += float(ii.get("vII", 0.0) or 0.0)
             if ibscbs:
-                tot_v_cbs += float(ibscbs.get("gCBS", {}).get("vCBS", 0.0) or 0.0)
-                tot_v_ibs_uf += float(ibscbs.get("gIBSUF", {}).get("vIBSUF", 0.0) or 0.0)
-                tot_v_ibs_mun += float(ibscbs.get("gIBSMun", {}).get("vIBSMun", 0.0) or 0.0)
+                _gib = ibscbs.get("gIBSCBS", {})
+                tot_v_cbs += float(_gib.get("gCBS", {}).get("vCBS", 0.0) or 0.0)
+                tot_v_ibs_uf += float(_gib.get("gIBSUF", {}).get("vIBSUF", 0.0) or 0.0)
+                tot_v_ibs_mun += float(_gib.get("gIBSMun", {}).get("vIBSMun", 0.0) or 0.0)
             if is_grp:
                 tot_v_is += float(is_grp.get("vIS", 0.0) or 0.0)
 
@@ -631,18 +657,22 @@ class ACBrAPIService:
         # tpIntegra=2 = "Pagamento nao integrado com o sistema de automacao da empresa".
         _TPAG_EXIGE_CARD = {"03", "04", "17"}
         det_pag = []
+        soma_v_pag = 0.0
         for pag in pagamentos:
             tpag = pag.get("meio_pagamento", "01")
+            v_pag_item = float(pag.get("valor", v_nf_base))
             item = {
                 "indPag": 0,
                 "tPag": tpag,
-                "vPag": float(pag.get("valor", v_nf_base)),
+                "vPag": v_pag_item,
             }
             if tpag in _TPAG_EXIGE_CARD:
                 item["card"] = {"tpIntegra": 2}
             det_pag.append(item)
+            soma_v_pag += v_pag_item
         if not det_pag:
             det_pag.append({"indPag": 0, "tPag": "01", "vPag": v_nf_base})
+            soma_v_pag = v_nf_base
 
         crt = 1
         if hasattr(empresa, "regime_tributario") and empresa.regime_tributario:
@@ -826,7 +856,7 @@ class ACBrAPIService:
                     },
                 },
                 "transp": {"modFrete": 9},
-                "pag": {"detPag": det_pag},
+                "pag": self._montar_pag(det_pag, soma_v_pag, v_nf),
             },
         }
 
