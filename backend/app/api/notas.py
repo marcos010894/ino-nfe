@@ -973,6 +973,57 @@ async def inutilizar_gap_ultima_emissao(
     }
 
 
+@router.get("/{nota_id}/reprocessar-preview")
+def preview_reprocessar(
+    empresa_id: int,
+    nota_id: int,
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Retorna {numero, serie, modelo} que serão usados no reprocessamento.
+
+    Mesma lógica do PUT /reprocessar (linhas ~1039-1050) — necessário pro modal
+    da UI mostrar preview antes do operador confirmar.
+    """
+    empresa = _verificar_empresa(empresa_id, session, current_user)
+    nota = session.get(Nota, nota_id)
+    if not nota or nota.empresa_id != empresa_id:
+        raise HTTPException(status_code=404, detail="Nota fiscal não encontrada.")
+    if nota.status != "rejeitada":
+        raise HTTPException(status_code=400, detail="Apenas notas rejeitadas podem ser reprocessadas.")
+
+    modelo_int = int(nota.modelo)
+    serie_padrao = empresa.serie_nfe if modelo_int == 55 else empresa.serie_nfce
+    ultimo = session.exec(
+        select(Nota.numero)
+        .where(
+            Nota.empresa_id == empresa_id,
+            Nota.modelo == str(modelo_int),
+            Nota.serie == serie_padrao,
+            Nota.numero.is_not(None),
+            Nota.id != nota.id,
+        )
+        .order_by(Nota.numero.desc())
+    ).first()
+    inicial = (empresa.proximo_nnf_inicial_nfe if modelo_int == 55
+               else empresa.proximo_nnf_inicial_nfce)
+    if inicial:
+        proximo = inicial
+        origem = "inicial_forcado"
+    elif ultimo:
+        proximo = ultimo + 1
+        origem = "max_mais_um"
+    else:
+        proximo = 1
+        origem = "fallback_1"
+    return {
+        "numero": proximo,
+        "serie": serie_padrao,
+        "modelo": modelo_int,
+        "origem": origem,
+    }
+
+
 @router.put("/{nota_id}/reprocessar", response_model=NotaResponse)
 async def reprocessar_nota(
     empresa_id: int,
@@ -1076,8 +1127,13 @@ async def reprocessar_nota(
     session.add(nota)
     session.commit()
     
-    # 5. Transmitir nova tentativa
-    status, resposta = await acbr_service.transmitir_nfce(payload)
+    # 5. Transmitir nova tentativa — rota depende do modelo.
+    # /nfce só aceita mod=65; /nfe só aceita mod=55. Mandar payload mod=55 em
+    # transmitir_nfce retorna "O campo 'mod' deve ser igual a 65".
+    if modelo_int == 55:
+        status, resposta = await acbr_service.transmitir_nfe(payload)
+    else:
+        status, resposta = await acbr_service.transmitir_nfce(payload)
     
     # 6. Atualizar resultado
     nota.status = status

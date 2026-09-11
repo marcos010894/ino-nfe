@@ -46,6 +46,7 @@ export default function CentralDocumentos() {
   const [jsonEdicao, setJsonEdicao] = useState<string>('');
   const [reprocessando, setReprocessando] = useState<boolean>(false);
   const [erroReprocessar, setErroReprocessar] = useState<string>('');
+  const [previewReprocessar, setPreviewReprocessar] = useState<{numero: number; serie: number; modelo: number} | null>(null);
 
   // Exportar Lote
   const [showExportModal, setShowExportModal] = useState<boolean>(false);
@@ -245,15 +246,27 @@ export default function CentralDocumentos() {
     }
   };
 
-  const abrirModalReprocessar = (nota: Nota) => {
+  const abrirModalReprocessar = async (nota: Nota) => {
     setNotaSelecionadaReprocessar(nota);
     setJsonEdicao(JSON.stringify(JSON.parse(nota.json_venda), null, 2));
     setErroReprocessar('');
+    setPreviewReprocessar(null);
+    try {
+      const res = await api.get(`/empresas/${empresaSelecionada}/notas/${nota.id}/reprocessar-preview`);
+      setPreviewReprocessar({
+        numero: res.data.numero,
+        serie: res.data.serie,
+        modelo: res.data.modelo,
+      });
+    } catch (err: any) {
+      // Preview falhou — não bloqueia o reprocessar; só some a caixinha
+      setPreviewReprocessar(null);
+    }
   };
 
   const executarReprocessamento = async () => {
     if (!notaSelecionadaReprocessar) return;
-    
+
     // Validar JSON antes de enviar
     try {
       JSON.parse(jsonEdicao);
@@ -265,11 +278,21 @@ export default function CentralDocumentos() {
     setReprocessando(true);
     setErroReprocessar('');
     try {
-      await api.put(`/empresas/${empresaSelecionada}/notas/${notaSelecionadaReprocessar.id}/reprocessar`, {
+      const res = await api.put(`/empresas/${empresaSelecionada}/notas/${notaSelecionadaReprocessar.id}/reprocessar`, {
         json_venda: jsonEdicao
       });
-      setNotaSelecionadaReprocessar(null);
-      carregarNotas();
+      // Backend retorna 200 mesmo em rejeição SEFAZ — checar status da nota.
+      const notaAtualizada = res.data as Nota;
+      if (notaAtualizada.status === "autorizada") {
+        setNotaSelecionadaReprocessar(null);
+        carregarNotas();
+      } else {
+        // Rejeição / denegação / pendente — mostrar motivo e manter modal aberto
+        setErroReprocessar(`SEFAZ ${notaAtualizada.status}: ${extrairMotivoErro(notaAtualizada)}`);
+        // Atualiza a nota do modal pra refletir novo motivo em próxima tentativa
+        setNotaSelecionadaReprocessar(notaAtualizada);
+        carregarNotas();
+      }
     } catch (err: any) {
       setErroReprocessar(err.response?.data?.detail || "Erro ao reprocessar a nota.");
     } finally {
@@ -281,7 +304,19 @@ export default function CentralDocumentos() {
     if (!nota.resposta_integradora) return "Rejeição desconhecida";
     try {
       const parsed = JSON.parse(nota.resposta_integradora);
-      return parsed.motivo || parsed.mensagem || parsed.erro || "Rejeitada pela SEFAZ";
+      // Formato ACBr: {error: {code, message, errors: [{code, message}, ...]}}
+      if (parsed.error) {
+        const inner = parsed.error.errors && parsed.error.errors[0];
+        if (inner && inner.message) return `${parsed.error.code || ""}: ${inner.message}`.trim();
+        if (parsed.error.message) return `${parsed.error.code || ""}: ${parsed.error.message}`.trim();
+      }
+      // Formato SEFAZ direto (autorização): {codigo_status, motivo_status}
+      if (parsed.autorizacao?.motivo_status) return `${parsed.autorizacao.codigo_status || ""}: ${parsed.autorizacao.motivo_status}`.trim();
+      if (parsed.autorizacao?.motivo) return `${parsed.autorizacao.codigo_status || ""}: ${parsed.autorizacao.motivo}`.trim();
+      if (parsed.motivo) return parsed.motivo;
+      if (parsed.mensagem) return parsed.mensagem;
+      if (parsed.erro) return parsed.erro;
+      return "Rejeitada pela SEFAZ";
     } catch {
       return nota.resposta_integradora;
     }
@@ -617,6 +652,16 @@ export default function CentralDocumentos() {
                 <span>{extrairMotivoErro(notaSelecionadaReprocessar)}</span>
               </div>
             </div>
+
+            {/* Preview do que vai ser transmitido */}
+            {previewReprocessar && (
+              <div className="bg-field border border-line rounded-lg p-3 text-xs flex items-center justify-between">
+                <span className="text-muted font-semibold uppercase">Próxima transmissão</span>
+                <span className="font-mono font-bold text-ink">
+                  {previewReprocessar.modelo === 55 ? "NF-e" : "NFC-e"} {previewReprocessar.modelo} · nº {previewReprocessar.numero} · série {previewReprocessar.serie}
+                </span>
+              </div>
+            )}
 
             {erroReprocessar && (
               <div className="bg-warn-tint border border-[#f0c9c4] text-warn p-2.5 rounded-lg text-xs font-semibold">
