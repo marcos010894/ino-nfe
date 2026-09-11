@@ -192,7 +192,12 @@ def _urls_integracao(nota: Nota) -> Tuple[Optional[str], Optional[str]]:
 
 def _nota_para_response(nota: Nota, incluir_detalhe: bool = False) -> Dict[str, Any]:
     resposta = _parse_json_safe(nota.resposta_integradora)
-    rej = _extrair_rejeicao(resposta)
+    # motivo/código só fazem sentido em status de erro. Em cancelada/autorizada
+    # a `resposta_integradora` guarda o retorno do último evento (ex: cStat 135
+    # "Evento registrado" pro cancelamento) — não é rejeição, mas o InnoSystem
+    # interpretava como se fosse.
+    _STATUS_COM_ERRO = {"rejeitada", "denegada", "pendente_consulta"}
+    rej = _extrair_rejeicao(resposta) if nota.status in _STATUS_COM_ERRO else {"motivo": None, "codigo": None}
     xml_url, pdf_url = _urls_integracao(nota)
     base = {
         "id": nota.id,
