@@ -26,6 +26,7 @@ interface Empresa {
   nome_fantasia: string;
   cnpj: string;
   has_certificado?: boolean;
+  has_csc_token?: boolean;
 }
 
 interface Rascunho {
@@ -402,19 +403,22 @@ export default function EmitirNota() {
                   );
                 })()}
 
-                {/* Botões */}
-                <div className="grid grid-cols-1 sm:grid-cols-[1.35fr_1fr] gap-3 mt-5">
-                  <BotaoEmitir
-                    disabled={etapa === 'transmitindo' || etapa === 'processando' || !!notaEmitida}
-                    onClick={() => abrirPreview('65')}
-                    primaria
-                    titulo="Emitir NFC-e"
-                    sub="Cupom para o consumidor · modelo 65"
-                  />
+                {/* Botões — NFC-e só aparece se empresa tem CSC cadastrado (evita
+                    ConfigNfceNotFound/cStat 464 na SEFAZ). Sem CSC, só NF-e. */}
+                <div className={`grid grid-cols-1 gap-3 mt-5 ${empresaAtual?.has_csc_token ? 'sm:grid-cols-[1.35fr_1fr]' : ''}`}>
+                  {empresaAtual?.has_csc_token && (
+                    <BotaoEmitir
+                      disabled={etapa === 'transmitindo' || etapa === 'processando' || !!notaEmitida}
+                      onClick={() => abrirPreview('65')}
+                      primaria
+                      titulo="Emitir NFC-e"
+                      sub="Cupom para o consumidor · modelo 65"
+                    />
+                  )}
                   <BotaoEmitir
                     disabled={etapa === 'transmitindo' || etapa === 'processando' || !!notaEmitida}
                     onClick={() => abrirPreview('55')}
-                    primaria={false}
+                    primaria={!empresaAtual?.has_csc_token}
                     titulo="Emitir NF-e"
                     sub="Nota modelo 55"
                   />
