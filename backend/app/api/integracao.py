@@ -199,25 +199,28 @@ def _nota_para_response(nota: Nota, incluir_detalhe: bool = False) -> Dict[str, 
     _STATUS_COM_ERRO = {"rejeitada", "denegada", "pendente_consulta"}
     rej = _extrair_rejeicao(resposta) if nota.status in _STATUS_COM_ERRO else {"motivo": None, "codigo": None}
     xml_url, pdf_url = _urls_integracao(nota)
+    # Convenção: campos string SEMPRE string (vazia se não tem valor). InnoSystem
+    # .NET quebrava com NRE ao consultar cancelada porque motivo_rejeicao vinha
+    # null (do fix 8f86410) e o cliente C# não guarda pra null.
     base = {
         "id": nota.id,
         "modelo": nota.modelo,
         "status": nota.status,
-        "chave_acesso": nota.chave_acesso,
+        "chave_acesso": nota.chave_acesso or "",
         "numero": nota.numero,
         "serie": nota.serie,
         "valor_total": nota.valor_total,
         "empresa_id": nota.empresa_id,
-        "xml_url": xml_url,
-        "pdf_url": pdf_url,
+        "xml_url": xml_url or "",
+        "pdf_url": pdf_url or "",
         "criado_em": nota.criado_em,
         "atualizado_em": nota.atualizado_em,
-        "motivo_rejeicao": rej["motivo"],
-        "codigo_status": rej["codigo"],
+        "motivo_rejeicao": rej["motivo"] or "",
+        "codigo_status": rej["codigo"] or "",
         "finalidade": nota.finalidade,
-        "nota_referenciada_chave": nota.nota_referenciada_chave,
+        "nota_referenciada_chave": nota.nota_referenciada_chave or "",
         "nota_referenciada_id": nota.nota_referenciada_id,
-        "natureza_operacao": nota.natureza_operacao,
+        "natureza_operacao": nota.natureza_operacao or "",
     }
     if incluir_detalhe:
         base["json_venda"] = _parse_json_safe(nota.json_venda)
