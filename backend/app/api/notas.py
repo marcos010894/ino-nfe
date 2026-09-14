@@ -122,11 +122,14 @@ async def criar_e_transmitir_nota(
     if not venda_data.get("itens"):
         raise HTTPException(status_code=400, detail="O JSON de venda precisa conter ao menos um item em 'itens'.")
 
-    # Calcular valor total
+    # Calcular valor total — unit já vem LÍQUIDO do InnoSystem (contrato
+    # 2026-09-11), `desconto` no topo é decorativo. Ver integracao.py:305
+    # e acbr_api.py:montar_payload_nfce pra racional completo.
     itens = venda_data.get("itens", [])
-    v_prod = sum(float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0)) for item in itens)
-    v_desc = float(venda_data.get("desconto", 0.0))
-    valor_total = round(v_prod - v_desc, 2)
+    valor_total = round(
+        sum(float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0)) for item in itens),
+        2,
+    )
 
     # 4. Reservar próximo nNF sequencial por (empresa, modelo, serie).
     # SEFAZ exige sequência ascendente; nNF aleatório causa cStat 204/539 em prod.
@@ -402,10 +405,12 @@ async def reenviar_nota_rejeitada(
     venda_data = _aplicar_destinatario_reenvio(venda_data, body.destinatario if body else None)
 
     # 4. Recalcular valor_total (destinatário mudou, mas itens podem ter permanecido)
+    #    Unit já é LÍQUIDO — desconto agregado é decorativo, não subtrai.
     itens = venda_data.get("itens", [])
-    v_prod = sum(float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0)) for item in itens)
-    v_desc = float(venda_data.get("desconto", 0.0))
-    valor_total = round(v_prod - v_desc, 2)
+    valor_total = round(
+        sum(float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0)) for item in itens),
+        2,
+    )
 
     # 5. Remontar payload — REUSA numero/serie da nota original
     modelo_int = int(nota.modelo) if nota.modelo else 65
@@ -1063,11 +1068,12 @@ async def reprocessar_nota(
     if not venda_data.get("itens"):
         raise HTTPException(status_code=400, detail="O JSON de venda precisa conter ao menos um item.")
 
-    # Calcular totais
+    # Calcular totais — unit LÍQUIDO, desconto decorativo (não subtrai).
     itens = venda_data.get("itens", [])
-    v_prod = sum(float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0)) for item in itens)
-    v_desc = float(venda_data.get("desconto", 0.0))
-    valor_total = round(v_prod - v_desc, 2)
+    valor_total = round(
+        sum(float(item.get("quantidade", 0)) * float(item.get("valor_unitario", 0)) for item in itens),
+        2,
+    )
 
     # 3. Reservar próximo nNF/serie pelo cadastro atual da empresa — MESMO padrão
     # do POST /emitir (linhas 127-171). Bug histórico: essa rota chamava
