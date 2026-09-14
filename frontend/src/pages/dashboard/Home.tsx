@@ -165,7 +165,7 @@ export default function Home() {
                 <Tooltip
                   contentStyle={{ borderRadius: '12px', border: '1px solid #e4e9f0', boxShadow: '0 8px 30px rgba(15,27,45,.06)', fontWeight: 'bold' }}
                   itemStyle={{ color: '#0b63c4' }}
-                  formatter={(v: number) => fmtMoeda(v)}
+                  formatter={(v: any) => fmtMoeda(Number(v))}
                 />
                 <Area type="monotone" dataKey="valor" stroke="#0b63c4" strokeWidth={3} fillOpacity={1} fill="url(#colorValor)" />
               </AreaChart>
@@ -242,7 +242,7 @@ export default function Home() {
                 <Tooltip
                   contentStyle={{ borderRadius: '12px', border: '1px solid #e4e9f0', boxShadow: '0 8px 30px rgba(15,27,45,.06)', fontWeight: 'bold' }}
                   itemStyle={{ color: '#e6a817' }}
-                  formatter={(v: number) => fmtMoeda(v)}
+                  formatter={(v: any) => fmtMoeda(Number(v))}
                 />
                 <Line type="monotone" dataKey="ticket" stroke="#e6a817" strokeWidth={4} dot={{ r: 6, fill: '#fff', stroke: '#e6a817', strokeWidth: 3 }} activeDot={{ r: 8 }} />
               </LineChart>
