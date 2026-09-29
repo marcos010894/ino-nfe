@@ -47,6 +47,10 @@ class SmtpNaoConfiguradoError(RuntimeError):
     """Faltam envs SMTP_* — bloqueia envio real."""
 
 
+class SemNotasNoPeriodoError(RuntimeError):
+    """Período selecionado tem 0 notas autorizadas/canceladas — nada a enviar."""
+
+
 @dataclass
 class ResultadoEnvio:
     ok: bool
@@ -125,12 +129,14 @@ async def enviar_para_contador(
     inicio: datetime,
     fim: datetime,
     disparado_por: str,  # "manual" | "cron"
+    assunto_override: Optional[str] = None,   # override do envio manual
+    mensagem_override: Optional[str] = None,  # override do envio manual
 ) -> ResultadoEnvio:
     """Envio síncrono (do ponto de vista do endpoint). Grava log sempre.
 
     Levanta ContadorNaoConfiguradoError / SmtpNaoConfiguradoError antes de
-    tocar em qualquer coisa. Se der ruim depois disso, grava `ok=False`
-    e re-levanta pro caller reportar.
+    tocar em qualquer coisa, e SemNotasNoPeriodoError se o filtro pegar 0
+    documentos válidos. Se der ruim depois disso, grava `ok=False` e re-levanta.
     """
     _garantir_contador(empresa)
     _garantir_smtp()
@@ -142,18 +148,25 @@ async def enviar_para_contador(
         destinatarios.append(empresa.email_cc_contador)
 
     notas = _carregar_notas_periodo(session, empresa.id, inicio, fim)
+    if not notas:
+        # Nada de mandar email vazio — poluiria a caixa do contador e
+        # confundiria o dono (viu que "enviou" mas não tinha nota).
+        raise SemNotasNoPeriodoError(
+            f"Sem notas autorizadas/canceladas em {periodo_label} — nada a enviar."
+        )
     lote = await preparar_lote(empresa, notas, inicio, fim, incluir="ambos")
 
     empresa_label = empresa.nome_fantasia or empresa.razao_social
+    # Prioridade: override do envio > template salvo na empresa > default do backend.
     assunto = aplicar_template(
-        empresa.assunto_email_contador,
+        assunto_override or empresa.assunto_email_contador,
         contador=empresa.nome_contador or "",
         empresa=empresa_label,
         periodo=periodo_label,
         fallback=ASSUNTO_PADRAO,
     )
     corpo = aplicar_template(
-        empresa.mensagem_email_contador,
+        mensagem_override or empresa.mensagem_email_contador,
         contador=empresa.nome_contador or "",
         empresa=empresa_label,
         periodo=periodo_label,

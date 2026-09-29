@@ -212,11 +212,18 @@ export default function CentralDocumentos() {
   const [preview, setPreview] = useState<PreviewExport | null>(null);
   const [carregandoPreview, setCarregandoPreview] = useState<boolean>(false);
 
-  // v3 — modal enviar ao contador (dispara o email na hora)
+  // v3 — modal enviar ao contador (dispara o email na hora, com override
+  // de período + assunto + mensagem por envio; começa pré-preenchido com
+  // filtro atual + template salvo, mas o dono pode ajustar tudo).
   const [showEnviarContador, setShowEnviarContador] = useState<boolean>(false);
   const [enviandoContador, setEnviandoContador] = useState<boolean>(false);
   const [erroEnviarContador, setErroEnviarContador] = useState<string>('');
   const [sucessoEnviarContador, setSucessoEnviarContador] = useState<string>('');
+  const [envioDataInicio, setEnvioDataInicio] = useState<string>('');
+  const [envioDataFim, setEnvioDataFim] = useState<string>('');
+  const [envioAssunto, setEnvioAssunto] = useState<string>('');
+  const [envioMensagem, setEnvioMensagem] = useState<string>('');
+  const [previewEnvio, setPreviewEnvio] = useState<PreviewExport | null>(null);
 
   // Filtros
   const [filtroStatus, setFiltroStatus] = useState<string>('');
@@ -490,8 +497,35 @@ export default function CentralDocumentos() {
   const abrirEnviarContador = async () => {
     setErroEnviarContador('');
     setSucessoEnviarContador('');
-    if (!contadorConfig) await carregarContadorConfig();
+    setPreviewEnvio(null);
+    // Pré-preenche com o filtro atual mas o dono pode ajustar dentro do modal
+    setEnvioDataInicio(intervalo.inicio.toISOString().slice(0, 10));
+    setEnvioDataFim(intervalo.fim.toISOString().slice(0, 10));
+    const cfg = contadorConfig || (await (async () => {
+      try {
+        const r = await api.get(`/empresas/${empresaSelecionada}/contador`);
+        setContadorConfig(r.data);
+        return r.data as ContadorConfig;
+      } catch { return null; }
+    })());
+    // Templates começam com o que está salvo — dono pode editar por envio
+    setEnvioAssunto(cfg?.assunto_email_contador || 'XMLs {empresa} · {periodo}');
+    setEnvioMensagem(cfg?.mensagem_email_contador || 'Olá, {contador}!\n\nSegue em anexo o lote de XMLs e o relatório fiscal da {empresa} referente a {periodo}.\n\nQualquer dúvida, é só responder este e-mail.');
     setShowEnviarContador(true);
+    // Já dispara o preview do período pré-preenchido
+    setTimeout(() => atualizarPreviewEnvio(), 100);
+  };
+
+  const atualizarPreviewEnvio = async () => {
+    if (!envioDataInicio || !envioDataFim || !empresaSelecionada) return;
+    try {
+      const res = await api.get(`/empresas/${empresaSelecionada}/notas/exportar-preview`, {
+        params: { data_inicio: envioDataInicio, data_fim: envioDataFim },
+      });
+      setPreviewEnvio(res.data as PreviewExport);
+    } catch {
+      setPreviewEnvio(null);
+    }
   };
 
   const dispararEnvioContador = async () => {
@@ -500,11 +534,13 @@ export default function CentralDocumentos() {
     setSucessoEnviarContador('');
     try {
       const res = await api.post(`/empresas/${empresaSelecionada}/contador/enviar`, {
-        data_inicio: intervalo.inicio.toISOString().slice(0, 10),
-        data_fim: intervalo.fim.toISOString().slice(0, 10),
+        data_inicio: envioDataInicio,
+        data_fim: envioDataFim,
+        assunto: envioAssunto,
+        mensagem: envioMensagem,
       });
       setSucessoEnviarContador(
-        `E-mail enviado para ${res.data.destinatarios.join(', ')} (${res.data.qtd_notas} nota${res.data.qtd_notas === 1 ? '' : 's'}).`,
+        `E-mail enviado para ${res.data.destinatarios.join(', ')} — ${res.data.qtd_notas} nota${res.data.qtd_notas === 1 ? '' : 's'} no ZIP.`,
       );
     } catch (err: any) {
       setErroEnviarContador(err.response?.data?.detail || 'Erro ao enviar e-mail para o contador.');
@@ -1830,15 +1866,18 @@ export default function CentralDocumentos() {
         </div>
       )}
 
-      {/* Modal Enviar ao contador (dispara e-mail na hora) */}
+      {/* Modal Enviar ao contador — período + assunto + mensagem editáveis */}
       {showEnviarContador && (
         <div className="fixed inset-0 bg-ink/40 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-          <div className="bg-card border border-line rounded-xl shadow-lg max-w-md w-full p-6 flex flex-col gap-4 animate-in fade-in-50 zoom-in-95 duration-150">
+          <div className="bg-card border border-line rounded-xl shadow-lg max-w-2xl w-full p-6 flex flex-col gap-4 animate-in fade-in-50 zoom-in-95 duration-150 max-h-[92vh] overflow-y-auto">
             <div className="flex items-start justify-between">
-              <h3 className="text-lg font-extrabold text-ink flex items-center gap-2">
-                <Send size={18} className="text-i9" />
-                Enviar ao contador
-              </h3>
+              <div>
+                <h3 className="text-lg font-extrabold text-ink flex items-center gap-2">
+                  <Send size={18} className="text-i9" />
+                  Enviar ao contador
+                </h3>
+                <p className="text-xs text-muted mt-1">Anexa ZIP com XMLs + PDFs + RELATORIO.pdf do período escolhido.</p>
+              </div>
               <button onClick={() => setShowEnviarContador(false)} className="text-muted hover:text-ink p-1.5 rounded-lg hover:bg-line-soft"><X size={16} /></button>
             </div>
 
@@ -1848,21 +1887,109 @@ export default function CentralDocumentos() {
               </div>
             ) : (
               <>
+                {/* Destinatários (readonly — muda na engrenagem) */}
                 <div className="bg-field border border-line rounded-lg p-3 text-xs flex flex-col gap-1">
                   <div><span className="text-muted">Para:</span> <b>{contadorConfig.email_contador}</b></div>
                   {contadorConfig.email_cc_contador && (
                     <div><span className="text-muted">Cc:</span> {contadorConfig.email_cc_contador}</div>
                   )}
-                  <div><span className="text-muted">Período:</span> {intervalo.labelLongo}</div>
-                  <div><span className="text-muted">Anexo:</span> ZIP (XMLs + PDFs + RELATORIO.pdf)</div>
                 </div>
 
-                {periodoEhMesAtual && (
-                  <div className="bg-amber-50 border border-amber-200 text-amber-800 p-3 rounded-lg text-xs flex items-start gap-2">
-                    <AlertCircle size={14} className="mt-0.5 flex-shrink-0" />
-                    <span>O período selecionado é o <b>mês atual em aberto</b>. Para fechamento, prefira o botão "Exportar mês anterior" e envie a partir dele.</span>
+                {/* Período editável */}
+                <div>
+                  <label className="text-xs font-bold text-muted uppercase">Período do lote</label>
+                  <div className="grid grid-cols-2 gap-2 mt-1.5">
+                    <input
+                      type="date"
+                      value={envioDataInicio}
+                      onChange={(e) => setEnvioDataInicio(e.target.value)}
+                      onBlur={atualizarPreviewEnvio}
+                      className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                    />
+                    <input
+                      type="date"
+                      value={envioDataFim}
+                      onChange={(e) => setEnvioDataFim(e.target.value)}
+                      onBlur={atualizarPreviewEnvio}
+                      className="bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none"
+                    />
+                  </div>
+                  <div className="flex gap-2 mt-2 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const hj = new Date();
+                        const mp = new Date(hj.getFullYear(), hj.getMonth() - 1, 1);
+                        setEnvioDataInicio(primeiroDiaMes(mp).toISOString().slice(0, 10));
+                        setEnvioDataFim(ultimoDiaMes(mp).toISOString().slice(0, 10));
+                        setTimeout(atualizarPreviewEnvio, 50);
+                      }}
+                      className="text-[11px] font-bold text-i9-dark bg-i9-tint border border-i9/30 hover:bg-i9-tint/70 rounded-lg px-3 py-1.5"
+                    >
+                      Mês passado inteiro
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const hj = new Date();
+                        setEnvioDataInicio(primeiroDiaMes(hj).toISOString().slice(0, 10));
+                        setEnvioDataFim(fimDoDia(hj).toISOString().slice(0, 10));
+                        setTimeout(atualizarPreviewEnvio, 50);
+                      }}
+                      className="text-[11px] font-bold text-ink-soft bg-field border border-line hover:bg-line-soft rounded-lg px-3 py-1.5"
+                    >
+                      Este mês (parcial)
+                    </button>
+                  </div>
+                </div>
+
+                {/* Preview de quantidade — mostra ANTES do disparo se tem nota */}
+                {previewEnvio && (
+                  <div className={`border rounded-lg p-3 text-xs flex items-center justify-between ${
+                    previewEnvio.qtd_total === 0
+                      ? 'bg-warn-tint border-[#f0c9c4] text-warn'
+                      : 'bg-i9-tint/40 border-i9/30 text-i9-dark'
+                  }`}>
+                    <div>
+                      <b>{previewEnvio.qtd_total}</b> nota{previewEnvio.qtd_total === 1 ? '' : 's'} no ZIP
+                      {previewEnvio.qtd_total > 0 && (
+                        <> · <b>{previewEnvio.qtd_nfce_autorizadas}</b> NFC-e · <b>{previewEnvio.qtd_nfe_autorizadas}</b> NF-e · <b>{previewEnvio.qtd_canceladas}</b> cancelada{previewEnvio.qtd_canceladas === 1 ? '' : 's'}</>
+                      )}
+                    </div>
+                    {previewEnvio.qtd_total > 0 && (
+                      <span className="font-mono font-bold">
+                        R$ {previewEnvio.valor_total_autorizadas.toFixed(2).replace('.', ',')}
+                      </span>
+                    )}
                   </div>
                 )}
+
+                {/* Assunto editável */}
+                <div>
+                  <label className="text-xs font-bold text-muted uppercase">Assunto</label>
+                  <input
+                    type="text"
+                    value={envioAssunto}
+                    onChange={(e) => setEnvioAssunto(e.target.value)}
+                    className="w-full bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none font-mono mt-1.5"
+                  />
+                </div>
+
+                {/* Mensagem editável */}
+                <div>
+                  <label className="text-xs font-bold text-muted uppercase">Mensagem</label>
+                  <textarea
+                    value={envioMensagem}
+                    onChange={(e) => setEnvioMensagem(e.target.value)}
+                    rows={7}
+                    className="w-full bg-field border border-line rounded-lg px-3 py-2 text-sm focus:border-i9 outline-none resize-none mt-1.5"
+                  />
+                  <div className="text-[10px] text-muted mt-1">
+                    Placeholders: <span className="font-mono bg-line-soft px-1.5 py-0.5 rounded">{'{contador}'}</span>{' '}
+                    <span className="font-mono bg-line-soft px-1.5 py-0.5 rounded">{'{empresa}'}</span>{' '}
+                    <span className="font-mono bg-line-soft px-1.5 py-0.5 rounded">{'{periodo}'}</span>
+                  </div>
+                </div>
 
                 {erroEnviarContador && (
                   <div className="bg-warn-tint border border-[#f0c9c4] text-warn p-3 rounded-lg text-xs font-semibold">{erroEnviarContador}</div>
@@ -1879,7 +2006,14 @@ export default function CentralDocumentos() {
               </button>
               <button
                 onClick={dispararEnvioContador}
-                disabled={enviandoContador || !contadorConfig?.email_contador || !!sucessoEnviarContador}
+                disabled={
+                  enviandoContador
+                  || !contadorConfig?.email_contador
+                  || !!sucessoEnviarContador
+                  || !envioDataInicio
+                  || !envioDataFim
+                  || (previewEnvio !== null && previewEnvio.qtd_total === 0)
+                }
                 className="px-4 py-2 text-xs font-bold text-white bg-gradient-to-b from-i9 to-i9-dark rounded-lg hover:opacity-90 transition-opacity disabled:opacity-50 flex items-center gap-1.5 shadow-sm"
               >
                 {enviandoContador ? <><Loader2 size={12} className="animate-spin" /> Enviando...</> : <><Send size={12} /> Enviar agora</>}

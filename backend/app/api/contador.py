@@ -26,6 +26,7 @@ from app.models.nota import Nota
 from app.models.usuario import Usuario
 from app.services.envio_contador import (
     ContadorNaoConfiguradoError,
+    SemNotasNoPeriodoError,
     SmtpNaoConfiguradoError,
     enviar_para_contador,
 )
@@ -131,9 +132,14 @@ def atualizar_config_contador(
 
 
 class EnviarContadorBody(BaseModel):
-    """Período opcional — se não vier, usa mês atual até agora."""
+    """Período opcional — se não vier, usa mês atual até agora.
+
+    Assunto/mensagem override permitem personalização por envio sem alterar
+    o template salvo (útil quando o dono quer adicionar contexto pontual)."""
     data_inicio: Optional[str] = None  # YYYY-MM-DD
     data_fim: Optional[str] = None     # YYYY-MM-DD
+    assunto: Optional[str] = None      # override do assunto salvo
+    mensagem: Optional[str] = None     # override do corpo salvo
 
 
 def _parse_data(s: Optional[str], *, fim: bool = False) -> Optional[datetime]:
@@ -175,9 +181,14 @@ async def enviar_contador_manual(
             inicio=inicio,
             fim=fim,
             disparado_por="manual",
+            assunto_override=body.assunto,
+            mensagem_override=body.mensagem,
         )
     except ContadorNaoConfiguradoError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except SemNotasNoPeriodoError as exc:
+        # 422 é mais preciso que 400 — a request é válida, o estado é que não permite
+        raise HTTPException(status_code=422, detail=str(exc))
     except SmtpNaoConfiguradoError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
