@@ -463,14 +463,17 @@ export default function CentralDocumentos() {
     setSalvandoContador(true);
     setErroContador('');
     try {
+      // Pydantic EmailStr rejeita "" com 422 — coerce vazio pra null (usuário
+      // limpou o campo). Mesmo trato pra nome/templates pra ficar consistente.
+      const naoVazio = (v: string | null | undefined) => (v && v.trim() ? v.trim() : null);
       const res = await api.put(`/empresas/${empresaSelecionada}/contador`, {
-        nome_contador: contadorConfig.nome_contador,
-        email_contador: contadorConfig.email_contador,
-        email_cc_contador: contadorConfig.email_cc_contador,
+        nome_contador: naoVazio(contadorConfig.nome_contador),
+        email_contador: naoVazio(contadorConfig.email_contador),
+        email_cc_contador: naoVazio(contadorConfig.email_cc_contador),
         dia_envio_contador: contadorConfig.dia_envio_contador,
         envio_automatico_contador: contadorConfig.envio_automatico_contador,
-        assunto_email_contador: contadorConfig.assunto_email_contador,
-        mensagem_email_contador: contadorConfig.mensagem_email_contador,
+        assunto_email_contador: naoVazio(contadorConfig.assunto_email_contador),
+        mensagem_email_contador: naoVazio(contadorConfig.mensagem_email_contador),
       });
       setContadorConfig(res.data as ContadorConfig);
       setShowConfigContador(false);
