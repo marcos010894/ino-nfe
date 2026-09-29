@@ -26,7 +26,10 @@ router = APIRouter(prefix="/empresas/{empresa_id}/notas", tags=["Notas Fiscais"]
 
 def _verificar_empresa(empresa_id: int, session: Session, current_user: Usuario) -> Empresa:
     empresa = session.get(Empresa, empresa_id)
-    if not empresa or empresa.usuario_id != current_user.id:
+    # Admin (is_admin=True) enxerga TODAS as empresas — necessário pro botão
+    # "Acessar emissor" do painel master, que abre /emitir na empresa de outro dono.
+    dono_ok = empresa and (empresa.usuario_id == current_user.id or current_user.is_admin)
+    if not empresa or not dono_ok:
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
     if empresa.deletada_em is not None:
         raise HTTPException(status_code=410, detail="Empresa deletada.")
@@ -35,10 +38,30 @@ def _verificar_empresa(empresa_id: int, session: Session, current_user: Usuario)
     return empresa
 
 @router.get("/", response_model=List[NotaResponse])
-def listar_notas(empresa_id: int, session: Session = Depends(get_session), current_user: Usuario = Depends(get_current_user)):
+def listar_notas(
+    empresa_id: int,
+    data_inicio: Optional[datetime] = Query(None, description="ISO 8601. Inclui notas com criado_em >= este timestamp."),
+    data_fim: Optional[datetime] = Query(None, description="ISO 8601. Inclui notas com criado_em <= este timestamp."),
+    status: Optional[str] = Query(None, description="Filtra por status (autorizada, rejeitada, cancelada, etc)."),
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Lista notas da empresa com filtros server-side opcionais.
+
+    Sem query params: retorna tudo (retro-compat com callers antigos).
+    Com data_inicio/data_fim: janela temporal por criado_em.
+    Com status: filtro exato.
+    """
     _verificar_empresa(empresa_id, session, current_user)
-    notas = session.exec(select(Nota).where(Nota.empresa_id == empresa_id).order_by(Nota.criado_em.desc())).all()
-    return notas
+    query = select(Nota).where(Nota.empresa_id == empresa_id)
+    if data_inicio is not None:
+        query = query.where(Nota.criado_em >= data_inicio)
+    if data_fim is not None:
+        query = query.where(Nota.criado_em <= data_fim)
+    if status:
+        query = query.where(Nota.status == status)
+    query = query.order_by(Nota.criado_em.desc())
+    return session.exec(query).all()
 
 
 @router.get("/proximo-numero")
@@ -205,6 +228,13 @@ async def criar_e_transmitir_nota(
         nova_nota.serie = SERIE_PADRAO
         nova_nota.atualizado_em = datetime.utcnow()
     else:
+        # Sem rascunho — emissão manual pela UI (dono cola JSON). Se o JSON tiver
+        # `numero_pedido_externo` (contrato do InnoSystem), propaga pra coluna
+        # indexada `numero_venda`. Se não tiver, fica None (traço na Central).
+        try:
+            _numero_venda_inline = json.loads(nota_in.json_venda).get("numero_pedido_externo")
+        except (ValueError, TypeError):
+            _numero_venda_inline = None
         nova_nota = Nota(
             empresa_id=empresa_id,
             usuario_id=current_user.id,
@@ -215,6 +245,7 @@ async def criar_e_transmitir_nota(
             payload_enviado=json.dumps(payload),
             numero=proximo_numero,
             serie=SERIE_PADRAO,
+            numero_venda=_numero_venda_inline,
             criado_em=datetime.utcnow(),
             atualizado_em=datetime.utcnow()
         )

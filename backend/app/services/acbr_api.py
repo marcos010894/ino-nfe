@@ -193,6 +193,117 @@ class ACBrAPIService:
         logger.warning(f"Sincronização cadastral ACBr falhou ({response.status_code}): {response.text}")
         return False, {"status_code": response.status_code, **body}
 
+    async def configurar_nfce_empresa(self, empresa: Empresa) -> Tuple[bool, Dict[str, Any]]:
+        """Envia a configuração de NFC-e (CSC) da empresa pro ACBr.
+
+        Método: PUT /empresas/{cnpj}/nfce
+        Payload: {"ambiente": "<producao|homologacao>", "sefaz": {"id_csc": <int>, "csc": "<token>"}}
+
+        Sem este PUT o ACBr rejeita a 1ª emissão com `ConfigNfceNotFound`
+        mesmo que csc_id e csc_token estejam salvos no MySQL do InnoFiscal.
+        """
+        if not empresa.csc_id or not empresa.csc_token:
+            return False, {"erro": "empresa sem csc_id/csc_token cadastrados"}
+
+        try:
+            token = await self._get_access_token()
+        except Exception as e:
+            return False, {"erro": f"Falha de autenticação ACBr: {e}"}
+
+        # csc_token é guardado criptografado (Fernet) no banco; decripta pra mandar.
+        from app.core.crypto import decrypt_data
+        try:
+            csc_plain = decrypt_data(empresa.csc_token)
+        except Exception as e:
+            return False, {"erro": f"Falha ao decriptar csc_token: {e}"}
+
+        try:
+            id_csc_int = int(str(empresa.csc_id).strip())
+        except (TypeError, ValueError):
+            return False, {"erro": f"csc_id inválido (esperado int): {empresa.csc_id!r}"}
+
+        cnpj_limpo = "".join(filter(str.isdigit, empresa.cnpj))
+        url = f"{self.base_url}/empresas/{cnpj_limpo}/nfce"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "ambiente": "producao" if self.env == "producao" else "homologacao",
+            "sefaz": {"id_csc": id_csc_int, "csc": csc_plain},
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.put(url, json=payload, headers=headers, timeout=15.0)
+        except Exception as e:
+            logger.error(f"Erro de comunicação no PUT /nfce ACBr: {e}")
+            return False, {"erro": str(e)}
+
+        if response.status_code in (200, 201):
+            return True, response.json() if response.content else {"status": "ok"}
+
+        logger.warning(f"PUT /nfce ACBr falhou ({response.status_code}): {response.text}")
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+        return False, {"status_code": response.status_code, **body}
+
+    async def configurar_nfe_empresa(self, empresa: Empresa) -> Tuple[bool, Dict[str, Any]]:
+        """Envia a configuração de NF-e (modelo 55) da empresa pro ACBr.
+
+        Método: PUT /empresas/{cnpj}/nfe
+        Payload: {"ambiente": "<producao|homologacao>", "CRT": <int>}
+
+        CRT vem de `empresa.regime_tributario`. ACBr default é 3 (Regime Normal)
+        se omitido — SN precisa mandar CRT=1 explícito.
+        """
+        try:
+            token = await self._get_access_token()
+        except Exception as e:
+            return False, {"erro": f"Falha de autenticação ACBr: {e}"}
+
+        # Mapeamento regime → CRT: 1=SN, 2=SN Excesso Sublimite, 3=Regime Normal, 4=MEI.
+        # Case-insensitive: usuário/UI pode salvar "lucro real" minúsculo.
+        regime_up = (empresa.regime_tributario or "").strip().upper()
+        if "MEI" in regime_up:
+            crt = 4
+        elif "EXCESSO" in regime_up or "SUBLIMITE" in regime_up:
+            crt = 2
+        elif "NORMAL" in regime_up or "LUCRO" in regime_up:
+            crt = 3
+        else:
+            crt = 1  # default Simples Nacional (perfil da base InnoFiscal)
+
+        cnpj_limpo = "".join(filter(str.isdigit, empresa.cnpj))
+        url = f"{self.base_url}/empresas/{cnpj_limpo}/nfe"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "ambiente": "producao" if self.env == "producao" else "homologacao",
+            "CRT": crt,
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.put(url, json=payload, headers=headers, timeout=15.0)
+        except Exception as e:
+            logger.error(f"Erro de comunicação no PUT /nfe ACBr: {e}")
+            return False, {"erro": str(e)}
+
+        if response.status_code in (200, 201):
+            return True, response.json() if response.content else {"status": "ok", "CRT": crt}
+
+        logger.warning(f"PUT /nfe ACBr falhou ({response.status_code}): {response.text}")
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+        return False, {"status_code": response.status_code, **body}
+
     async def enviar_certificado_acbr(
         self, empresa: Empresa, certificado_base64: str, senha: str
     ) -> Tuple[bool, Dict[str, Any]]:

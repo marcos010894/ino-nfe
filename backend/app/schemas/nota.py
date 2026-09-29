@@ -8,6 +8,9 @@ class NotaBase(BaseModel):
     chave_acesso: Optional[str] = None
     numero: Optional[int] = None
     serie: Optional[int] = None
+    # Nº da venda de origem no sistema externo (InnoSystem passa via
+    # ReceberVendaPayload.numero_pedido_externo). None quando emitida direto pela UI.
+    numero_venda: Optional[str] = None
     valor_total: float = 0.0
     json_venda: str = "{}"
     payload_enviado: Optional[str] = None

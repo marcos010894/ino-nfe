@@ -38,10 +38,36 @@ from fastapi.responses import FileResponse
 
 if os.path.exists("frontend_dist"):
     app.mount("/assets", StaticFiles(directory="frontend_dist/assets"), name="assets")
-    
+
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):
         path = os.path.join("frontend_dist", full_path)
         if os.path.isfile(path):
             return FileResponse(path)
         return FileResponse("frontend_dist/index.html")
+
+    # Rotas do SPA que COLIDEM com rotas da API (ex.: `/admin/empresas`) são
+    # matched pela API antes do catch-all acima. Quando o browser dá F5 nessas
+    # URLs sem JWT, a API retorna 401 JSON em vez do SPA — a UI some.
+    # Este middleware devolve o index.html quando: método GET + status 401/403/404
+    # + Accept do request pede text/html (só browser navegando). Requests fetch
+    # do axios (Accept: application/json) passam sem alteração.
+    from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
+
+    class SpaHtmlFallbackMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            response = await call_next(request)
+            path = request.url.path
+            if (
+                request.method == "GET"
+                and response.status_code in (401, 403, 404)
+                and "text/html" in request.headers.get("accept", "")
+                and not path.startswith("/assets")
+                and not path.startswith("/health")
+                and not path.startswith("/docs")
+                and not path.startswith("/openapi")
+            ):
+                return FileResponse("frontend_dist/index.html")
+            return response
+
+    app.add_middleware(SpaHtmlFallbackMiddleware)

@@ -12,7 +12,7 @@ router = APIRouter(prefix="/empresas/{empresa_id}/regras", tags=["Regras Fiscais
 
 def _verificar_empresa(empresa_id: int, session: Session, current_user: Usuario) -> Empresa:
     empresa = session.get(Empresa, empresa_id)
-    if not empresa or empresa.usuario_id != current_user.id:
+    if not empresa or (empresa.usuario_id != current_user.id and not current_user.is_admin):
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
     if empresa.deletada_em is not None:
         raise HTTPException(status_code=410, detail="Empresa deletada.")

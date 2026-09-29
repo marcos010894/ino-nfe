@@ -14,6 +14,10 @@ class Nota(SQLModel, table=True):
     acbr_id: Optional[str] = Field(default=None, max_length=64, index=True)  # id interno ACBr (nfc_xxx / nfe_xxx) — usado em GET XML/PDF e cancelamento
     numero: Optional[int] = None
     serie: Optional[int] = None
+    # Nº da venda de origem no sistema externo (InnoSystem manda em
+    # ReceberVendaPayload.numero_pedido_externo). String pra aceitar prefixos
+    # ("V-1750") ou zero-fill. Indexada pensando em busca futura por esse número.
+    numero_venda: Optional[str] = Field(default=None, max_length=64, index=True)
     valor_total: float = Field(default=0.0)
     
     json_venda: str = Field(default="{}")  # JSON colado do InnoSystem
@@ -31,3 +35,8 @@ class Nota(SQLModel, table=True):
 
     criado_em: datetime = Field(default_factory=datetime.utcnow)
     atualizado_em: datetime = Field(default_factory=datetime.utcnow)
+    # Cursor de piggyback do GET /integracao/notas?com_mudancas=true. Quando o
+    # bloco `mudancas_recentes` inclui esta nota (cancelada pós-autorização),
+    # `notificado_em` é setado. Próxima resposta só re-inclui se
+    # `atualizado_em > notificado_em`. NULL = nunca notificada.
+    notificado_em: Optional[datetime] = Field(default=None, index=True)

@@ -88,12 +88,12 @@ async def testar_conexao_acbr(current_user: Usuario = Depends(get_current_user))
 
 @router.get("/", response_model=List[EmpresaResponse])
 def listar_empresas(session: Session = Depends(get_session), current_user: Usuario = Depends(get_current_user)):
-    empresas = session.exec(
-        select(Empresa).where(
-            Empresa.usuario_id == current_user.id,
-            Empresa.deletada_em.is_(None),
-        )
-    ).all()
+    # Admin (painel master) enxerga TODAS as empresas — necessário pra ele conseguir
+    # abrir /emitir?empresa_id=X em qualquer empresa via botão "Acessar emissor".
+    query = select(Empresa).where(Empresa.deletada_em.is_(None))
+    if not current_user.is_admin:
+        query = query.where(Empresa.usuario_id == current_user.id)
+    empresas = session.exec(query).all()
     return [format_empresa_response(emp) for emp in empresas]
 
 @router.post("/", response_model=EmpresaResponse)
@@ -127,7 +127,7 @@ async def criar_empresa(emp_in: EmpresaCreate, session: Session = Depends(get_se
 @router.put("/{empresa_id}", response_model=EmpresaResponse)
 async def atualizar_empresa(empresa_id: int, emp_in: EmpresaUpdate, session: Session = Depends(get_session), current_user: Usuario = Depends(get_current_user)):
     empresa = session.get(Empresa, empresa_id)
-    if not empresa or empresa.usuario_id != current_user.id:
+    if not empresa or (empresa.usuario_id != current_user.id and not current_user.is_admin):
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
         
     emp_data = emp_in.dict(exclude_unset=True)
@@ -157,7 +157,7 @@ def deletar_empresa(empresa_id: int, session: Session = Depends(get_session), cu
     """Soft-delete: mantém empresa + notas no banco (obrigação fiscal 5 anos),
     mas some da listagem do dono. Hard delete só via SQL manual do admin."""
     empresa = session.get(Empresa, empresa_id)
-    if not empresa or empresa.usuario_id != current_user.id:
+    if not empresa or (empresa.usuario_id != current_user.id and not current_user.is_admin):
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
     if empresa.deletada_em is None:
         empresa.deletada_em = datetime.utcnow()
@@ -174,7 +174,7 @@ async def upload_certificado(
     current_user: Usuario = Depends(get_current_user)
 ):
     empresa = session.get(Empresa, empresa_id)
-    if not empresa or empresa.usuario_id != current_user.id:
+    if not empresa or (empresa.usuario_id != current_user.id and not current_user.is_admin):
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
         
     from app.services.certificado_service import save_certificado_file, parse_certificado
@@ -197,7 +197,20 @@ async def upload_certificado(
     ok, res = await acbr_service.enviar_certificado_acbr(empresa, dados_cert["base64"], senha)
     empresa.acbr_sincronizado = ok
     if ok:
-        empresa.acbr_ultimo_status = f"Certificado: {res.get('motivo') or res.get('status') or 'Ativo no ACBr'}"
+        status_cert = f"Certificado: {res.get('motivo') or res.get('status') or 'Ativo no ACBr'}"
+
+        # Cert ok → sobe também config NFC-e (se CSC cadastrado) e NF-e.
+        # Sem isso o cliente cai em ConfigNfceNotFound / ConfigNfeNotFound
+        # na 1ª emissão. Falhas aqui não bloqueiam o cert em si — reportam
+        # no acbr_ultimo_status pra dono resolver via botão Sincronizar.
+        if empresa.csc_id and empresa.csc_token:
+            ok_nfce, res_nfce = await acbr_service.configurar_nfce_empresa(empresa)
+            status_cert += " | NFC-e config OK" if ok_nfce else f" | NFC-e ERRO: {_extrair_msg_erro_acbr(res_nfce)}"
+
+        ok_nfe, res_nfe = await acbr_service.configurar_nfe_empresa(empresa)
+        status_cert += f" | NF-e config OK (CRT={res_nfe.get('CRT', '?')})" if ok_nfe else f" | NF-e ERRO: {_extrair_msg_erro_acbr(res_nfe)}"
+
+        empresa.acbr_ultimo_status = status_cert
     else:
         msg = _extrair_msg_erro_acbr(res)
         empresa.acbr_ultimo_status = f"Erro certificado: {msg}"
@@ -218,7 +231,7 @@ async def upload_certificado(
 async def sincronizar_acbr(empresa_id: int, session: Session = Depends(get_session), current_user: Usuario = Depends(get_current_user)):
     """Força o teste e sincronização cadastral + certificado com a ACBr API."""
     empresa = session.get(Empresa, empresa_id)
-    if not empresa or empresa.usuario_id != current_user.id:
+    if not empresa or (empresa.usuario_id != current_user.id and not current_user.is_admin):
         raise HTTPException(status_code=404, detail="Empresa não encontrada.")
         
     acbr_service = ACBrAPIService()
@@ -244,6 +257,31 @@ async def sincronizar_acbr(empresa_id: int, session: Session = Depends(get_sessi
             msg_cert = _extrair_msg_erro_acbr(res_cert)
             status_msg += f" | Erro cert: {msg_cert}"
             erros.append(f"certificado: {msg_cert}")
+
+    # Configuração NFC-e (só se empresa tem CSC cadastrado). Sem esse PUT o
+    # ACBr rejeita a 1ª emissão com ConfigNfceNotFound mesmo com csc_id/token
+    # no MySQL local. Ver: gap conhecido do sync ACBr (memory 2026-09-13).
+    if empresa.csc_id and empresa.csc_token:
+        ok_nfce, res_nfce = await acbr_service.configurar_nfce_empresa(empresa)
+        ok_emp = ok_emp and ok_nfce
+        if ok_nfce:
+            status_msg += " | NFC-e: config OK"
+        else:
+            msg_nfce = _extrair_msg_erro_acbr(res_nfce)
+            status_msg += f" | Erro NFC-e: {msg_nfce}"
+            erros.append(f"nfce: {msg_nfce}")
+
+    # Configuração NF-e 55 (sempre — CRT deriva de regime_tributario).
+    # Só faz sentido depois do cert; se não tem cert, pula pra evitar 404 ACBr.
+    if empresa.certificado_base64:
+        ok_nfe, res_nfe = await acbr_service.configurar_nfe_empresa(empresa)
+        ok_emp = ok_emp and ok_nfe
+        if ok_nfe:
+            status_msg += f" | NF-e: config OK (CRT={res_nfe.get('CRT', '?')})"
+        else:
+            msg_nfe = _extrair_msg_erro_acbr(res_nfe)
+            status_msg += f" | Erro NF-e: {msg_nfe}"
+            erros.append(f"nfe: {msg_nfe}")
 
     empresa.acbr_sincronizado = ok_emp
     empresa.acbr_ultimo_status = status_msg

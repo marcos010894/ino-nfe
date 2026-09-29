@@ -1,6 +1,10 @@
 fastapi
 uvicorn
-sqlmodel
+# sqlmodel >=0.0.25 recusa datetime naive em INSERTs — quebra models que
+# usam `default_factory=datetime.utcnow`. Pinar 0.0.22 (aceita naive) até
+# refatorar todos os models pra timezone.utc.
+sqlmodel==0.0.22
+sqlalchemy<2.1
 alembic
 pydantic-settings
 python-jose[cryptography]

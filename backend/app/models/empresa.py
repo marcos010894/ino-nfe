@@ -58,5 +58,9 @@ class Empresa(SQLModel, table=True):
     bloqueada: bool = Field(default=False)
     deletada_em: Optional[datetime] = Field(default=None, index=True)
 
+    # Metadado livre (só o admin usa): código do cliente no InnoSystem ou outro ERP,
+    # pra facilitar o cross-reference. Nenhuma lógica de negócio depende dele.
+    codigo_cliente_innosystem: Optional[str] = Field(default=None)
+
     criado_em: datetime = Field(default_factory=datetime.utcnow)
 

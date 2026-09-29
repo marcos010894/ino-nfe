@@ -25,6 +25,8 @@ class EmpresaBase(BaseModel):
     # Próximo nNF inicial (migração de ERP). NULL = começa em 1.
     proximo_nnf_inicial_nfe: Optional[int] = None
     proximo_nnf_inicial_nfce: Optional[int] = None
+    # Metadado livre pro admin cruzar com o cliente no InnoSystem/ERP.
+    codigo_cliente_innosystem: Optional[str] = None
 
 class EmpresaCreate(EmpresaBase):
     pass

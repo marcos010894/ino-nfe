@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Body, Query
 from fastapi.responses import StreamingResponse
-from sqlmodel import Session, select
-from typing import Dict, Any, Optional, List, Tuple
+from sqlmodel import Session, select, or_
+from typing import Dict, Any, Optional, List, Tuple, Union
 from datetime import timedelta, datetime
 import io
 import json
@@ -128,6 +128,9 @@ class NotaIntegracaoResponse(BaseModel):
     chave_acesso: Optional[str] = None
     numero: Optional[int] = None
     serie: Optional[int] = None
+    # Nº da venda de origem no InnoSystem (o mesmo `numero_pedido_externo` que
+    # o integrador manda em POST /receber-venda). String vazia se ausente.
+    numero_venda: Optional[str] = None
     valor_total: float
     empresa_id: Optional[int] = None
     xml_url: Optional[str] = None
@@ -147,6 +150,37 @@ class NotaIntegracaoDetalhe(NotaIntegracaoResponse):
     """Detalhe completo — inclui json_venda original e o retorno bruto da ACBr."""
     json_venda: Optional[Dict[str, Any]] = None
     resposta_integradora: Optional[Dict[str, Any]] = None
+
+
+class MudancaStatusNota(BaseModel):
+    """Resumo de uma nota que mudou de status DEPOIS de autorizada — hoje só
+    cancelamentos. Vai no bloco `mudancas_recentes` do GET /integracao/notas
+    quando o integrador passa `?com_mudancas=true`.
+
+    O integrador (InnoSystem) usa isso pra sincronizar o ERP sem consultar
+    nota-por-nota: enquanto o polling de rascunhos em andamento continua igual,
+    esse bloco piggyback informa cancelamentos ocorridos após a autorização.
+    """
+    id: int
+    numero: Optional[int] = None
+    serie: Optional[int] = None
+    modelo: str
+    chave_acesso: str = ""
+    numero_venda: str = ""
+    status_atual: str  # "cancelada" hoje
+    atualizado_em: datetime
+    motivo: str = ""  # justificativa do cancelamento (do evento SEFAZ)
+
+
+class NotasListagemResponse(BaseModel):
+    """Shape retornado pelo GET /integracao/notas?com_mudancas=true.
+
+    Sem `com_mudancas`: endpoint retorna `List[NotaIntegracaoResponse]` (shape
+    antigo, retro-compat total). Com `com_mudancas=true`: retorna este wrapper
+    com o mesmo array + o bloco de mudanças pós-autorização.
+    """
+    notas: List[NotaIntegracaoResponse]
+    mudancas_recentes: List[MudancaStatusNota]
 
 
 def _parse_json_safe(raw: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -209,6 +243,7 @@ def _nota_para_response(nota: Nota, incluir_detalhe: bool = False) -> Dict[str, 
         "chave_acesso": nota.chave_acesso or "",
         "numero": nota.numero,
         "serie": nota.serie,
+        "numero_venda": nota.numero_venda or "",
         "valor_total": nota.valor_total,
         "empresa_id": nota.empresa_id,
         "xml_url": xml_url or "",
@@ -226,6 +261,46 @@ def _nota_para_response(nota: Nota, incluir_detalhe: bool = False) -> Dict[str, 
         base["json_venda"] = _parse_json_safe(nota.json_venda)
         base["resposta_integradora"] = resposta
     return base
+
+def _extrair_motivo_cancelamento(nota: Nota) -> str:
+    """Justificativa do cancelamento gravada em `resposta_integradora`.
+
+    O evento de cancelamento no ACBr guarda `xJust` no bloco `cancelamento` ou
+    dentro de `autorizacao.xJust`. Se não encontrar, devolve string vazia (regra
+    'string nunca null').
+    """
+    resposta = _parse_json_safe(nota.resposta_integradora)
+    if not resposta:
+        return ""
+    canc = resposta.get("cancelamento") or {}
+    justificativa = (
+        canc.get("justificativa")
+        or canc.get("xJust")
+        or canc.get("motivo")
+        or resposta.get("justificativa")
+        or resposta.get("xJust")
+    )
+    if justificativa:
+        return str(justificativa)
+    # Fallback: se cancelada e não achou justificativa, devolve o motivo_status do último evento
+    aut = resposta.get("autorizacao") or {}
+    return aut.get("motivo_status") or ""
+
+
+def _mudanca_para_response(nota: Nota) -> Dict[str, Any]:
+    """Monta o item do bloco `mudancas_recentes`. String nunca null."""
+    return {
+        "id": nota.id,
+        "numero": nota.numero,
+        "serie": nota.serie,
+        "modelo": nota.modelo,
+        "chave_acesso": nota.chave_acesso or "",
+        "numero_venda": nota.numero_venda or "",
+        "status_atual": nota.status,
+        "atualizado_em": nota.atualizado_em,
+        "motivo": _extrair_motivo_cancelamento(nota),
+    }
+
 
 async def get_user_by_api_key(x_api_key: Optional[str] = Header(None), session: Session = Depends(get_session)) -> Usuario:
     if not x_api_key:
@@ -316,7 +391,10 @@ async def receber_venda_externa(
         status="rascunho",
         json_venda=payload.model_dump_json(),
         valor_total=valor_total,
-        modelo="65"  # Padrão para vendas (NFC-e)
+        modelo="65",  # Padrão para vendas (NFC-e)
+        # Persiste o Nº da venda em coluna própria (indexada) pra Central mostrar
+        # sem precisar parsear json_venda em toda linha.
+        numero_venda=payload.numero_pedido_externo,
     )
 
     session.add(nova_nota)
@@ -721,11 +799,109 @@ async def obter_rascunho(
     return rascunho
 
 
+class EnderecoRascunhoPatch(BaseModel):
+    """Sobrescreve o bloco `cliente.endereco` do json_venda do rascunho.
+    Campos ausentes / None não tocam no valor existente; strings vazias
+    contam como "usuário limpou o campo" e sobrescrevem.
+    """
+    logradouro: Optional[str] = None
+    numero: Optional[str] = None
+    complemento: Optional[str] = None
+    bairro: Optional[str] = None
+    cidade: Optional[str] = None
+    uf: Optional[str] = None
+    cep: Optional[str] = None
+    codigo_municipio: Optional[str] = None
+
+
+@router.patch("/rascunhos/{rascunho_id}/endereco", response_model=NotaResponse)
+async def atualizar_endereco_rascunho(
+    rascunho_id: int,
+    body: EnderecoRascunhoPatch,
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """
+    Atualiza SÓ o `cliente.endereco` dentro do json_venda do rascunho.
+    Usado quando o InnoSystem manda uma venda com endereço incompleto e o
+    operador precisa corrigir aqui pra destravar a emissão de NF-e 55 (que
+    exige enderDest completo).
+    """
+    rascunho = session.exec(
+        select(Nota)
+        .where(Nota.id == rascunho_id)
+        .where(Nota.usuario_id == current_user.id)
+    ).first()
+
+    if not rascunho:
+        raise HTTPException(status_code=404, detail="Rascunho não encontrado.")
+
+    if rascunho.status != "rascunho":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Nota já foi transmitida (status={rascunho.status}). Só rascunhos podem ser editados.",
+        )
+
+    try:
+        venda = json.loads(rascunho.json_venda or "{}")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="json_venda do rascunho está corrompido.")
+
+    cliente = dict(venda.get("cliente") or {})
+    endereco = dict(cliente.get("endereco") or {})
+    campos_novos = body.model_dump(exclude_none=True)
+    endereco.update(campos_novos)
+    cliente["endereco"] = endereco
+    venda["cliente"] = cliente
+
+    rascunho.json_venda = json.dumps(venda, ensure_ascii=False)
+    rascunho.atualizado_em = datetime.utcnow()
+    session.add(rascunho)
+    session.commit()
+    session.refresh(rascunho)
+    return rascunho
+
+
+@router.delete("/rascunhos/{rascunho_id}", status_code=204)
+async def excluir_rascunho(
+    rascunho_id: int,
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """
+    Exclui um rascunho (nota status='rascunho') do usuário.
+    Só permite deletar se a nota ainda não virou emissão fiscal — status
+    diferente de 'rascunho' retorna 409 pra evitar apagar histórico de nota
+    já enviada à SEFAZ. Depois de excluído, o InnoSystem volta a poder
+    reenviar a mesma venda como um novo rascunho.
+    """
+    rascunho = session.exec(
+        select(Nota)
+        .where(Nota.id == rascunho_id)
+        .where(Nota.usuario_id == current_user.id)
+    ).first()
+
+    if not rascunho:
+        raise HTTPException(status_code=404, detail="Rascunho não encontrado.")
+
+    if rascunho.status != "rascunho":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Nota já foi transmitida (status={rascunho.status}). Só rascunhos podem ser excluídos.",
+        )
+
+    session.delete(rascunho)
+    session.commit()
+
+
 # ---------------------------------------------------------------------------
 # Consulta de notas por Token de Integração (X-API-Key)
 # ---------------------------------------------------------------------------
 
-@router.get("/notas", response_model=List[NotaIntegracaoResponse])
+@router.get(
+    "/notas",
+    response_model=Union[List[NotaIntegracaoResponse], NotasListagemResponse],
+)
 async def listar_notas_integracao(
     ids: Optional[str] = Query(None, description="Lista de ids separados por vírgula (ex: 1,2,3). Ignora demais filtros de listagem."),
     status: Optional[str] = Query(None, description="Filtra por status: rascunho, processando, autorizada, rejeitada, cancelada"),
@@ -733,6 +909,16 @@ async def listar_notas_integracao(
     empresa_id: Optional[int] = Query(None, description="Filtra por empresa emissora"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    com_mudancas: bool = Query(
+        False,
+        description=(
+            "Se true, resposta muda pra {notas:[...], mudancas_recentes:[...]}. "
+            "O bloco mudancas_recentes traz notas do MESMO usuário que foram "
+            "canceladas depois de autorizadas e ainda não foram informadas — "
+            "cursor por nota via coluna interna. Sem esse param, resposta é o "
+            "array plano tradicional (retro-compat)."
+        ),
+    ),
     usuario: Usuario = Depends(get_user_by_api_key),
     session: Session = Depends(get_session),
 ):
@@ -744,6 +930,9 @@ async def listar_notas_integracao(
       viraram nota autorizada). Retorna só os que existem e pertencem ao
       usuário; máximo 200 ids por chamada.
     - `?status=autorizada&limit=50` → notas recém autorizadas.
+    - `?com_mudancas=true` → adiciona bloco `mudancas_recentes` com
+      cancelamentos pós-autorização não notificados (piggyback: evita o
+      integrador consultar de novo nota já autorizada).
 
     Retorna status atual, chave, número, série, motivo de rejeição e URLs
     de XML/PDF. Ordenado por criado_em desc.
@@ -758,8 +947,11 @@ async def listar_notas_integracao(
         if len(id_list) > 200:
             raise HTTPException(status_code=400, detail="Máximo de 200 ids por chamada.")
         if not id_list:
-            return []
-        query = query.where(Nota.id.in_(id_list)).order_by(Nota.criado_em.desc())
+            notas_lista: List[Dict[str, Any]] = []
+        else:
+            query = query.where(Nota.id.in_(id_list)).order_by(Nota.criado_em.desc())
+            notas = session.exec(query).all()
+            notas_lista = [_nota_para_response(n) for n in notas]
     else:
         if status:
             query = query.where(Nota.status == status)
@@ -768,9 +960,44 @@ async def listar_notas_integracao(
         if empresa_id is not None:
             query = query.where(Nota.empresa_id == empresa_id)
         query = query.order_by(Nota.criado_em.desc()).offset(offset).limit(limit)
+        notas = session.exec(query).all()
+        notas_lista = [_nota_para_response(n) for n in notas]
 
-    notas = session.exec(query).all()
-    return [_nota_para_response(n) for n in notas]
+    if not com_mudancas:
+        return notas_lista
+
+    # ---- Bloco piggyback ----
+    # Cancelamentos do MESMO usuário ainda não notificados. Idempotência via
+    # `notificado_em`: se a nota é re-cancelada (não acontece) ou o timestamp
+    # mudar por outro motivo, o filtro `atualizado_em > notificado_em` reinclui.
+    # LIMIT 50 pra bounded payload — se acumular mais, próxima chamada colhe.
+    mudancas_query = (
+        select(Nota)
+        .where(Nota.usuario_id == usuario.id)
+        .where(Nota.status == "cancelada")
+        .where(
+            or_(
+                Nota.notificado_em.is_(None),
+                Nota.atualizado_em > Nota.notificado_em,
+            )
+        )
+        .order_by(Nota.atualizado_em.desc())
+        .limit(50)
+    )
+    mudancas = session.exec(mudancas_query).all()
+
+    mudancas_lista = [_mudanca_para_response(n) for n in mudancas]
+
+    # Marca como entregues DEPOIS de montar o payload — se der erro no commit,
+    # o integrador simplesmente vê a mesma nota de novo na próxima chamada.
+    now = datetime.utcnow()
+    for n in mudancas:
+        n.notificado_em = now
+        session.add(n)
+    if mudancas:
+        session.commit()
+
+    return {"notas": notas_lista, "mudancas_recentes": mudancas_lista}
 
 
 @router.get("/notas/{nota_id}", response_model=NotaIntegracaoDetalhe)
