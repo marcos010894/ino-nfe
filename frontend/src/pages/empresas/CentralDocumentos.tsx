@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   FileText, Download, XOctagon, RefreshCw, AlertCircle, ShieldCheck, HelpCircle, Eye,
   Loader2, Ban, Clock, ShieldX, Search, ChevronLeft, ChevronRight, ChevronDown, Copy, X,
-  Settings, Send, Bell, Package, Receipt, CalendarDays,
+  Settings, Send, Package, Receipt, CalendarDays,
 } from 'lucide-react';
 import api from '../../lib/api';
 
@@ -194,6 +194,9 @@ export default function CentralDocumentos() {
   // v3 — aba ativa no topo (NFC-e / NF-e / Inutilizadas). Filtra `notas` no client
   // por modelo/status. Server-side já traz tudo do período — evita 3 requests.
   const [abaAtiva, setAbaAtiva] = useState<Aba>('nfce');
+
+  // v3 — busca livre (nº nota, nº venda, cliente, CPF/CNPJ, chave)
+  const [busca, setBusca] = useState<string>('');
 
   // v3 — alertas do banner ("N itens precisam de atenção")
   const [alertas, setAlertas] = useState<AlertasResponse | null>(null);
@@ -697,17 +700,34 @@ export default function CentralDocumentos() {
     setDropdownPeriodoAberto(false);
   };
 
-  // ----- v3 — recorte por aba ativa -----
+  // ----- v3 — recorte por aba ativa + busca livre -----
   // NFC-e: modelo 65, todos status EXCETO inutilizada.
   // NF-e:  modelo 55, todos status EXCETO inutilizada.
   // Inutilizadas: status inutilizada (qualquer modelo).
   const notasDaAba = useMemo(() => {
+    let base: Nota[];
     if (abaAtiva === 'inutilizadas') {
-      return notas.filter(n => n.status === 'inutilizada');
+      base = notas.filter(n => n.status === 'inutilizada');
+    } else {
+      const modelo = abaAtiva === 'nfce' ? '65' : '55';
+      base = notas.filter(n => n.modelo === modelo && n.status !== 'inutilizada');
     }
-    const modelo = abaAtiva === 'nfce' ? '65' : '55';
-    return notas.filter(n => n.modelo === modelo && n.status !== 'inutilizada');
-  }, [notas, abaAtiva]);
+    const q = busca.trim().toLowerCase();
+    if (!q) return base;
+    // Busca por nº nota, série, nº venda, cliente e chave de acesso (44 digitos)
+    return base.filter(n => {
+      const cliente = extrairCliente(n).toLowerCase();
+      const venda = parseJsonSafe(n.json_venda);
+      const doc = String(venda?.cliente?.cpf || venda?.cliente?.cnpj || '').toLowerCase();
+      return (
+        String(n.numero ?? '').includes(q)
+        || (n.numero_venda || '').toLowerCase().includes(q)
+        || cliente.includes(q)
+        || (n.chave_acesso || '').includes(q)
+        || doc.includes(q)
+      );
+    });
+  }, [notas, abaAtiva, busca]);
 
   // Contadores por aba (mostrados no chip de cada tab)
   const contadoresAba = useMemo(() => ({
@@ -729,97 +749,8 @@ export default function CentralDocumentos() {
   return (
     <div className="flex flex-col gap-6 pb-12">
 
-      {/* Header */}
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-        <div>
-          <h1 className="text-3xl font-extrabold tracking-tight">Central de Documentos</h1>
-          <p className="text-muted text-sm font-medium mt-1">Gerencie, filtre, baixe ou cancele suas notas fiscais eletrônicas.</p>
-        </div>
-
-        <div className="flex items-end gap-3 w-full md:w-auto flex-wrap">
-          <div className="flex flex-col gap-1 w-full md:w-60">
-            <label className="text-[10px] font-bold text-muted uppercase">Empresa Ativa</label>
-            <select
-              value={empresaSelecionada}
-              onChange={(e) => setEmpresaSelecionada(e.target.value)}
-              className="bg-card border border-line rounded-lg px-3 py-2 text-sm font-semibold text-ink focus:border-i9 outline-none shadow-sm w-full"
-            >
-              {empresas.map(emp => (
-                <option key={emp.id} value={emp.id}>{emp.nome_fantasia || emp.razao_social}</option>
-              ))}
-            </select>
-          </div>
-
-          {/* v3.1 · Exportar mês anterior — atalho pro contador */}
-          <button
-            onClick={exportarMesAnterior}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-4 py-2 rounded-lg text-sm flex flex-col items-start shadow-sm flex-shrink-0"
-            title="Fecha o mês passado inteiro (V3.1)"
-          >
-            <div className="flex items-center gap-2"><CalendarDays size={15} /> Exportar mês anterior</div>
-            <span className="text-[10px] opacity-90 font-medium mt-0.5">Só produção · p/ contador</span>
-          </button>
-
-          {/* Exportar lote — abre preview (V3.3) */}
-          <button
-            onClick={abrirPreviewExport}
-            className="bg-gradient-to-b from-i9 to-i9-dark hover:opacity-90 transition-opacity text-white font-bold px-4 py-2 rounded-lg text-sm flex flex-col items-start shadow-sm flex-shrink-0"
-          >
-            <div className="flex items-center gap-2"><Package size={15} /> Exportar lote</div>
-            <span className="text-[10px] opacity-80 font-medium mt-0.5">
-              {intervalo.labelCurto} · prévia antes de baixar
-            </span>
-          </button>
-
-          {/* v3.6 · Enviar ao contador — abre modal de disparo */}
-          <button
-            onClick={abrirEnviarContador}
-            className="bg-ink hover:opacity-90 text-white font-bold px-4 py-2 rounded-lg text-sm flex items-center gap-2 shadow-sm flex-shrink-0"
-            title="Manda XMLs + relatório pro contador por e-mail"
-          >
-            <Send size={15} /> Enviar ao contador
-          </button>
-
-          {/* Engrenagem — abre modal Dados do contador */}
-          <button
-            onClick={abrirConfigContador}
-            className="bg-field border border-line hover:bg-line-soft text-ink-soft font-bold p-2.5 rounded-lg flex items-center shadow-sm flex-shrink-0"
-            title="Dados do contador"
-          >
-            <Settings size={16} />
-          </button>
-        </div>
-      </div>
-
-      {/* v3 — Banner de alertas ("N itens precisam de atenção") */}
-      {alertas && alertas.itens.length > 0 && (
-        <div className="bg-warn-tint/60 border border-warn/40 rounded-DEFAULT shadow-sm px-4 py-3 flex flex-col md:flex-row items-start md:items-center gap-3">
-          <div className="flex items-center gap-2 text-warn font-extrabold text-sm flex-shrink-0">
-            <Bell size={16} />
-            {alertas.total} {alertas.total === 1 ? 'item precisa' : 'itens precisam'} de atenção
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {alertas.itens.map((a, i) => {
-              const dot =
-                a.severidade === 'erro' ? 'bg-warn'
-                  : a.severidade === 'warn' ? 'bg-amber-500'
-                  : 'bg-slate-400';
-              return (
-                <span
-                  key={i}
-                  className="inline-flex items-center gap-1.5 bg-card border border-line rounded-full px-3 py-1 text-xs font-semibold text-ink-soft"
-                >
-                  <span className={`w-2 h-2 rounded-full ${dot}`} />
-                  {a.label}
-                </span>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
       {/* v3 — Tabs no topo (NFC-e / NF-e / Inutilizadas) */}
-      <div className="border-b border-line flex items-center gap-1 -mb-2">
+      <div className="border-b border-line flex items-center gap-1">
         {([
           ['nfce', 'NFC-e emitidas', Receipt, contadoresAba.nfce],
           ['nfe', 'NF-e emitidas', FileText, contadoresAba.nfe],
@@ -847,6 +778,116 @@ export default function CentralDocumentos() {
           );
         })}
       </div>
+
+      {/* Breadcrumb + Título dinâmico da aba (bate com o mockup do prototype) */}
+      <div className="flex items-start">
+        <div>
+          <div className="text-xs font-semibold text-muted">Central de Documentos ›</div>
+          <h1 className="text-3xl font-extrabold tracking-tight mt-1">
+            {abaAtiva === 'nfce' ? 'NFC-e emitidas'
+              : abaAtiva === 'nfe' ? 'NF-e emitidas'
+              : 'Notas inutilizadas'}
+          </h1>
+        </div>
+      </div>
+
+      {/* Toolbar — Empresa ativa | Exportar lote | Exportar mês anterior | Enviar | Gear */}
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="flex flex-col gap-1 w-full md:w-64">
+          <label className="text-[10px] font-bold text-muted uppercase">Empresa ativa</label>
+          <select
+            value={empresaSelecionada}
+            onChange={(e) => setEmpresaSelecionada(e.target.value)}
+            className="bg-card border border-line rounded-lg px-3 py-2.5 text-sm font-semibold text-ink focus:border-i9 outline-none shadow-sm w-full"
+          >
+            {empresas.map(emp => (
+              <option key={emp.id} value={emp.id}>{emp.nome_fantasia || emp.razao_social}</option>
+            ))}
+          </select>
+        </div>
+
+        {/* Exportar lote — pastel azul, badge "NEW prévia" (V3.3 preview) */}
+        <button
+          onClick={abrirPreviewExport}
+          className="relative bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-900 font-bold px-5 py-3 rounded-lg text-sm flex items-center gap-2 flex-shrink-0 transition-colors"
+        >
+          <Download size={16} />
+          Exportar lote
+          <span className="ml-1 text-[10px] font-extrabold bg-white/70 border border-blue-200 text-blue-800 rounded px-1.5 py-0.5">
+            NF-e + NFC-e
+          </span>
+          <span className="absolute -top-2 -right-2 text-[9px] font-extrabold bg-orange-500 text-white rounded px-1.5 py-0.5 shadow">
+            NEW prévia
+          </span>
+        </button>
+
+        {/* Exportar mês anterior — pastel verde, badge "NEW" (V3.1) */}
+        <button
+          onClick={exportarMesAnterior}
+          className="relative bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-900 font-bold px-5 py-3 rounded-lg text-sm flex items-center gap-2 flex-shrink-0 transition-colors"
+          title="Fecha o mês passado inteiro (V3.1)"
+        >
+          <CalendarDays size={16} />
+          Exportar mês anterior
+          <span className="ml-1 text-[10px] font-extrabold bg-white/70 border border-emerald-200 text-emerald-800 rounded px-1.5 py-0.5">
+            p/ contador
+          </span>
+          <span className="absolute -top-2 -right-2 text-[9px] font-extrabold bg-orange-500 text-white rounded px-1.5 py-0.5 shadow">
+            NEW
+          </span>
+        </button>
+
+        {/* Enviar ao contador — ícone (dispara e-mail direto) */}
+        <button
+          onClick={abrirEnviarContador}
+          className="relative bg-card border border-line hover:bg-line-soft text-ink-soft p-3 rounded-lg flex items-center shadow-sm flex-shrink-0"
+          title="Enviar XMLs + relatório pro contador por e-mail"
+        >
+          <Send size={18} />
+          <span className="absolute -top-2 -right-2 text-[9px] font-extrabold bg-orange-500 text-white rounded px-1.5 py-0.5 shadow">
+            NEW
+          </span>
+        </button>
+
+        {/* Engrenagem — dados do contador (V3.6) */}
+        <button
+          onClick={abrirConfigContador}
+          className="relative bg-card border border-line hover:bg-line-soft text-ink-soft p-3 rounded-lg flex items-center shadow-sm flex-shrink-0"
+          title="Dados do contador"
+        >
+          <Settings size={18} />
+          <span className="absolute -top-2 -right-2 text-[9px] font-extrabold bg-orange-500 text-white rounded px-1.5 py-0.5 shadow">
+            NEW
+          </span>
+        </button>
+      </div>
+
+      {/* v3 — Banner de alertas ("N itens precisam de atenção") */}
+      {alertas && alertas.itens.length > 0 && (
+        <div className="bg-warn-tint/60 border border-warn/40 rounded-DEFAULT shadow-sm px-4 py-3 flex flex-col md:flex-row items-start md:items-center gap-3">
+          <div className="flex items-center gap-2 text-warn font-extrabold text-sm flex-shrink-0">
+            <AlertCircle size={16} />
+            {alertas.total} {alertas.total === 1 ? 'item precisa' : 'itens precisam'} de atenção
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {alertas.itens.map((a, i) => {
+              const dot =
+                a.severidade === 'erro' ? 'bg-warn'
+                  : a.severidade === 'warn' ? 'bg-amber-500'
+                  : 'bg-slate-400';
+              return (
+                <span
+                  key={i}
+                  className="inline-flex items-center gap-1.5 bg-card border border-line rounded-full px-3 py-1 text-xs font-semibold text-ink-soft"
+                >
+                  <span className={`w-2 h-2 rounded-full ${dot}`} />
+                  {a.label}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Barra de Filtros + Card Total */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -958,9 +999,26 @@ export default function CentralDocumentos() {
             R$ {totalPeriodo.toFixed(2).replace('.', ',')}
           </span>
           <span className="text-[10px] text-muted text-center leading-relaxed">
-            {notasAutorizadas.length} {notasAutorizadas.length === 1 ? 'nota autorizada' : 'notas autorizadas'} · canceladas e rejeitadas não entram na soma
+            {notasAutorizadas.length} {notasAutorizadas.length === 1 ? 'nota autorizada' : 'notas autorizadas'} · canceladas, inutilizadas e rejeitadas não entram na soma
           </span>
         </div>
+      </div>
+
+      {/* v3 — Search bar + helper text (bate com o mockup) */}
+      <div className="flex flex-col gap-2">
+        <div className="relative">
+          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted" />
+          <input
+            type="text"
+            value={busca}
+            onChange={(e) => setBusca(e.target.value)}
+            placeholder="Buscar nº da nota, venda, cliente, CPF/CNPJ ou chave"
+            className="w-full bg-card border border-line rounded-lg pl-10 pr-4 py-3 text-sm focus:border-i9 outline-none shadow-sm placeholder:text-muted/70"
+          />
+        </div>
+        <p className="text-[11px] text-muted text-center md:text-left">
+          Clique no título da coluna para ordenar · no funil para filtrar · em "Nº Venda" para ver o histórico da venda
+        </p>
       </div>
 
       {/* Tabela de Notas */}
@@ -987,8 +1045,7 @@ export default function CentralDocumentos() {
                   <th className="px-4 py-3">Nº Venda</th>
                   <th className="px-4 py-3">Número</th>
                   <th className="px-4 py-3">Série</th>
-                  <th className="px-4 py-3">Modelo</th>
-                  <th className="px-4 py-3">Data da Emissão</th>
+                  <th className="px-4 py-3">Emissão</th>
                   <th className="px-4 py-3">Status</th>
                   <th className="px-4 py-3">Data do Status</th>
                   <th className="px-4 py-3">Cliente</th>
@@ -1017,9 +1074,6 @@ export default function CentralDocumentos() {
                       </td>
                       <td className="px-4 py-3 font-mono font-bold text-ink">{nota.numero ?? '—'}</td>
                       <td className="px-4 py-3 font-mono text-ink-soft">{nota.serie ?? '—'}</td>
-                      <td className="px-4 py-3 text-xs font-bold text-muted whitespace-nowrap">
-                        {nota.modelo === '65' ? 'NFC-e (65)' : 'NF-e (55)'}
-                      </td>
                       <td className="px-4 py-3 text-ink-soft whitespace-nowrap">
                         <div className="font-bold text-ink">{emis.data}</div>
                         <div className="text-[11px] text-muted">{emis.hora}</div>
