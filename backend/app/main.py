@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.models.database import init_db
-from app.api import auth, empresas, regras_fiscais, notas, integracao, admin, dashboard
+from app.api import auth, empresas, regras_fiscais, notas, integracao, admin, dashboard, contador
+# Import garante que SQLModel enxergue a tabela no create_all() em fresh DB.
+from app.models import envio_contador_log  # noqa: F401
+from app.services.scheduler import iniciar_scheduler, parar_scheduler
 
 app = FastAPI(title="InnoNFe API", description="API para emissão fiscal", version="1.0.0")
 
@@ -18,6 +21,15 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     init_db()
+    # Cron do envio ao contador. No-op quando ENVIO_CONTADOR_CRON_ATIVO=false
+    # (dev/local por default). Ligado no VPS via env var.
+    iniciar_scheduler()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    parar_scheduler()
+
 
 @app.get("/health")
 def health_check():
@@ -30,6 +42,7 @@ app.include_router(notas.router)
 app.include_router(integracao.router)
 app.include_router(admin.router)
 app.include_router(dashboard.router)
+app.include_router(contador.router)
 
 # Servir o frontend (React dist)
 import os

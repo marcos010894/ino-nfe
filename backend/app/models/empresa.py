@@ -62,5 +62,19 @@ class Empresa(SQLModel, table=True):
     # pra facilitar o cross-reference. Nenhuma lógica de negócio depende dele.
     codigo_cliente_innosystem: Optional[str] = Field(default=None)
 
+    # Dados do contador — Central de Documentos v3 (2026-09-28).
+    # Modal "Dados do contador" (V3.6) grava aqui. Botão "Enviar ao contador"
+    # e o cron mensal usam esses campos pra montar o email.
+    nome_contador: Optional[str] = Field(default=None)
+    email_contador: Optional[str] = Field(default=None)
+    email_cc_contador: Optional[str] = Field(default=None)  # cópia opcional (ex: dono)
+    # Dia do mês em que o cron dispara o envio. Limitado a 1..28 pra sobreviver a
+    # fevereiro. NULL = envio automático desligado.
+    dia_envio_contador: Optional[int] = Field(default=None)
+    envio_automatico_contador: bool = Field(default=False)
+    # Templates com placeholders {contador}, {empresa}, {periodo}. NULL = default do backend.
+    assunto_email_contador: Optional[str] = Field(default=None)
+    mensagem_email_contador: Optional[str] = Field(default=None)
+
     criado_em: datetime = Field(default_factory=datetime.utcnow)
 

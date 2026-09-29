@@ -16,3 +16,9 @@ httpx
 pydantic[email]
 pymysql
 cryptography
+# Relatório PDF do lote de notas (Central v3 · V3.5) — puro Python, sem
+# deps de sistema (diferente de weasyprint/wkhtmltopdf).
+reportlab
+# Cron in-process do envio mensal ao contador (Central v3). Roda no mesmo
+# worker do FastAPI — job cada hora vê se hoje é dia_envio de alguém.
+apscheduler

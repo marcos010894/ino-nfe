@@ -4,7 +4,6 @@ from sqlmodel import Session, select
 from typing import List, Optional
 import json
 from datetime import datetime
-import zipfile
 import io
 import httpx
 from app.models.database import get_session
@@ -20,6 +19,7 @@ from app.api.auth import get_current_user
 from app.api.integracao import _eh_denegacao, _eh_timeout_acbr
 from app.services.acbr_api import ACBrAPIService
 from app.services.xml_parser import parse_nfe_xml
+from app.services import exportador_notas
 from fastapi import UploadFile, File
 
 router = APIRouter(prefix="/empresas/{empresa_id}/notas", tags=["Notas Fiscais"])
@@ -1200,98 +1200,117 @@ async def reprocessar_nota(
     session.refresh(nota)
     return nota
 
+def _parse_data_range(data_inicio: Optional[str], data_fim: Optional[str]) -> tuple[datetime, datetime]:
+    """Converte strings YYYY-MM-DD do frontend em (inicio 00:00, fim 23:59).
+
+    Fallback: se `data_inicio` vier vazio, usa 1º dia do mês atual UTC — evita
+    o caller ter que calcular. `data_fim` vazio = agora."""
+    if data_inicio:
+        try:
+            ini = datetime.strptime(data_inicio, "%Y-%m-%d")
+        except ValueError:
+            ini = datetime(datetime.utcnow().year, datetime.utcnow().month, 1)
+    else:
+        agora = datetime.utcnow()
+        ini = datetime(agora.year, agora.month, 1)
+    if data_fim:
+        try:
+            fim = datetime.strptime(data_fim, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, microsecond=999999
+            )
+        except ValueError:
+            fim = datetime.utcnow()
+    else:
+        fim = datetime.utcnow()
+    return ini, fim
+
+
+def _filtrar_notas_periodo(
+    session: Session,
+    empresa_id: int,
+    status: Optional[str],
+    modelo: Optional[str],
+    inicio: datetime,
+    fim: datetime,
+) -> list[Nota]:
+    """Query + filtro em memória de data (evita divergência SQLite/MySQL)."""
+    query = select(Nota).where(Nota.empresa_id == empresa_id)
+    if status:
+        query = query.where(Nota.status == status)
+    if modelo:
+        query = query.where(Nota.modelo == modelo)
+    notas = session.exec(query).all()
+    return [n for n in notas if n.criado_em and inicio <= n.criado_em <= fim]
+
+
+@router.get("/exportar-preview")
+def preview_exportar_lote(
+    empresa_id: int,
+    status: Optional[str] = Query(None, description="Filtra status antes de contar."),
+    modelo: Optional[str] = Query(None, description="'65' ou '55' — só um tipo."),
+    data_inicio: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    data_fim: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    session: Session = Depends(get_session),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Prévia do ZIP antes de baixar (Central v3 · V3.3).
+
+    Só conta e resume — não bate na ACBr. Frontend mostra "vai baixar N NFC-e
+    + M NF-e = R$ X.XX" e pergunta se pode prosseguir.
+    """
+    empresa = _verificar_empresa(empresa_id, session, current_user)
+    inicio, fim = _parse_data_range(data_inicio, data_fim)
+    notas = _filtrar_notas_periodo(session, empresa_id, status, modelo, inicio, fim)
+    notas_com_doc = [n for n in notas if n.status in ("autorizada", "cancelada")]
+    resumo = exportador_notas.resumir(empresa, notas_com_doc, inicio, fim)
+    return {
+        "empresa": {"id": empresa.id, "cnpj": empresa.cnpj, "nome": resumo.empresa_nome},
+        "periodo": {
+            "inicio": inicio.isoformat(),
+            "fim": fim.isoformat(),
+            "label": resumo.periodo_label,
+        },
+        "qtd_nfce_autorizadas": resumo.qtd_nfce_autorizadas,
+        "qtd_nfe_autorizadas": resumo.qtd_nfe_autorizadas,
+        "qtd_canceladas": resumo.qtd_canceladas,
+        "qtd_total": resumo.qtd_total,
+        "valor_total_autorizadas": resumo.valor_total_autorizadas,
+        "notas": resumo.notas_resumo,
+    }
+
+
 @router.get("/exportar")
 async def exportar_notas_lote(
     empresa_id: int,
     status: Optional[str] = Query(None),
+    modelo: Optional[str] = Query(None),
     data_inicio: Optional[str] = Query(None),
     data_fim: Optional[str] = Query(None),
-    incluir: str = Query("ambos"), # xml, pdf, ambos
+    incluir: str = Query("ambos"),  # xml, pdf, ambos
     session: Session = Depends(get_session),
-    current_user: Usuario = Depends(get_current_user)
+    current_user: Usuario = Depends(get_current_user),
 ):
+    """Baixa lote de XMLs+PDFs em ZIP organizado por pasta + RELATORIO.pdf.
+
+    V3.4: pastas `NFC-e/`, `NF-e/`, `Canceladas/` dentro do ZIP.
+    V3.5: `RELATORIO.pdf` com resumo + tabela.
+    """
     empresa = _verificar_empresa(empresa_id, session, current_user)
-    
-    # 1. Buscar as notas com filtros aplicados
-    query = select(Nota).where(Nota.empresa_id == empresa_id)
-    if status:
-        query = query.where(Nota.status == status)
-    
-    notas = session.exec(query).all()
-    
-    # Filtrar por data no Python para consistência de conversão de string de data do frontend
-    if data_inicio:
-        try:
-            d_ini = datetime.strptime(data_inicio, "%Y-%m-%d")
-            notas = [n for n in notas if n.criado_em >= d_ini]
-        except ValueError:
-            pass
-            
-    if data_fim:
-        try:
-            d_fim = datetime.strptime(data_fim, "%Y-%m-%d")
-            # Ajustar para o final do dia
-            d_fim = d_fim.replace(hour=23, minute=59, second=59, microsecond=999999)
-            notas = [n for n in notas if n.criado_em <= d_fim]
-        except ValueError:
-            pass
-
-    # Filtrar apenas notas autorizadas ou canceladas que possuem documentos
-    notas_com_doc = [n for n in notas if n.status in ["autorizada", "cancelada"]]
-    
+    inicio, fim = _parse_data_range(data_inicio, data_fim)
+    notas = _filtrar_notas_periodo(session, empresa_id, status, modelo, inicio, fim)
+    notas_com_doc = [n for n in notas if n.status in ("autorizada", "cancelada")]
     if not notas_com_doc:
-        raise HTTPException(status_code=400, detail="Nenhuma nota fiscal autorizada ou cancelada encontrada no lote filtrado.")
-
-    # 2. Criar o ZIP em memória — baixa XML/PDF direto da ACBr (nada de mock)
-    zip_buffer = io.BytesIO()
-    acbr_service = ACBrAPIService()
-    falhas: list[str] = []
-
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for nota in notas_com_doc:
-            chave = nota.chave_acesso or f"NOTA_SEM_CHAVE_{nota.id}"
-            num = nota.numero or nota.id
-            ser = nota.serie or 1
-            filename_base = f"{chave}_n{num}_s{ser}"
-            # Modelo real vem do prefixo do id da ACBr (`nfc_` = 65, `nfe_` = 55).
-            # Isso protege contra divergências históricas entre `nota.modelo` e a rota usada.
-            if nota.acbr_id and nota.acbr_id.startswith("nfc_"):
-                modelo = 65
-            elif nota.acbr_id and nota.acbr_id.startswith("nfe_"):
-                modelo = 55
-            else:
-                modelo = 65 if nota.modelo == "65" else 55
-
-            if not nota.acbr_id:
-                falhas.append(f"{filename_base}: sem acbr_id (nota não foi emitida via ACBr) — XML/PDF indisponíveis")
-                continue
-
-            if incluir in ["xml", "ambos"]:
-                ok, xml_data = await acbr_service.baixar_xml(nota.acbr_id, modelo=modelo)
-                if ok:
-                    zip_file.writestr(f"{filename_base}.xml", xml_data)
-                else:
-                    falhas.append(f"{filename_base}.xml: ACBr rejeitou — {xml_data}")
-
-            if incluir in ["pdf", "ambos"]:
-                ok, pdf_data = await acbr_service.baixar_pdf(nota.acbr_id, modelo=modelo)
-                if ok:
-                    zip_file.writestr(f"{filename_base}.pdf", pdf_data)
-                else:
-                    falhas.append(f"{filename_base}.pdf: ACBr rejeitou — {pdf_data}")
-
-
-        if falhas:
-            zip_file.writestr("RELATORIO_FALHAS.txt", "\n".join(falhas).encode("utf-8"))
-
-    zip_buffer.seek(0)
-    
-    # 3. Stream do arquivo ZIP
-    filename = f"notas_lote_{empresa.cnpj}_{datetime.now().strftime('%Y%m%d%H%M')}.zip"
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhuma nota fiscal autorizada ou cancelada encontrada no lote filtrado.",
+        )
+    lote = await exportador_notas.preparar_lote(
+        empresa, notas_com_doc, inicio, fim, incluir=incluir
+    )
     return StreamingResponse(
-        zip_buffer,
+        io.BytesIO(lote.zip_bytes),
         media_type="application/x-zip-compressed",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={"Content-Disposition": f"attachment; filename={lote.filename}"},
     )
 
 @router.get("/{nota_id}/xml")
